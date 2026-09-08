@@ -96,7 +96,10 @@ const fixtures = base.extend<TestArgs, { suite: Suite }>({
       const configDir = path.join(workDir, "fleetctl-ops");
       await mkdir(configDir, { mode: 0o700, recursive: true });
       const fleetctl = new FleetctlClient({
-        binary: path.resolve(process.cwd(), "../../bin/fleetctl"),
+        binary: process.execPath,
+        prefixArgs: [
+          path.resolve(process.cwd(), "../../client/cli/dist/main.js"),
+        ],
         browser,
         configDir,
         sandbox,

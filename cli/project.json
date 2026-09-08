@@ -1,5 +1,5 @@
 {
-  "name": "cli",
+  "name": "go-cli",
   "root": "cli",
   "projectType": "application",
   "tags": ["lang:go", "scope:cli"],
