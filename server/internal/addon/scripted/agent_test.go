@@ -178,17 +178,21 @@ func TestAgent_Deliver_AckFailureThenSuccess(t *testing.T) {
 		Raw:          raw,
 	}}
 
-	// First attempt: ack should fail -- Deliver returns an error.
+	// First attempt: ack should fail asynchronously.
+	// Deliver returns immediately (interface contract) and reports the failure async.
 	err := agent.Deliver(context.Background(), scriptedTarget(), "d1", manifests, domain.DeliveryAuth{}, nil, 1)
-	if err == nil {
-		t.Fatal("expected ack failure error, got nil")
+	if err != nil {
+		t.Fatalf("first Deliver: %v", err)
 	}
 
-	// No event or result should have been reported.
+	// Wait for ack failure result (async).
 	select {
-	case event := <-reporter.ackCh:
-		t.Fatalf("unexpected event after ack failure: %v", event)
-	default:
+	case result := <-reporter.done:
+		if result.State != domain.DeliveryStateFailed {
+			t.Errorf("first result state = %v, want failed", result.State)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for ack failure result")
 	}
 
 	// Second attempt with a new delivery ID (platform retry): ack should succeed.
@@ -197,11 +201,11 @@ func TestAgent_Deliver_AckFailureThenSuccess(t *testing.T) {
 		t.Fatalf("second Deliver: %v", err)
 	}
 
-	// Should get the ack event now.
+	// Should get the ack success event.
 	select {
 	case event := <-reporter.ackCh:
 		if event.Kind != domain.DeliveryEventProgress {
-			t.Errorf("event kind = %v, want progress", event.Kind)
+			t.Errorf("second ack event kind = %v, want progress", event.Kind)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for ack event")
@@ -317,11 +321,24 @@ func TestAgent_Deliver_WithLatency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
-	ackElapsed := time.Since(start)
+	deliverElapsed := time.Since(start)
 
-	// Ack latency should be at least 50ms.
-	if ackElapsed < 40*time.Millisecond {
-		t.Errorf("ack returned too quickly: %v", ackElapsed)
+	// Deliver should return quickly (async ack/completion).
+	if deliverElapsed > 100*time.Millisecond {
+		t.Errorf("Deliver took too long: %v", deliverElapsed)
+	}
+
+	// Wait for ack event with latency.
+	ackStart := time.Now()
+	select {
+	case <-reporter.ackCh:
+		ackLatency := time.Since(ackStart)
+		// Ack should have been delayed by ~50ms in the async goroutine.
+		if ackLatency < 40*time.Millisecond {
+			t.Errorf("ack event arrived too quickly: %v", ackLatency)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for ack event")
 	}
 
 	// Wait for completion result.
@@ -996,5 +1013,205 @@ func TestAgent_Deliver_InventoryRetry_StillReportsDelivered(t *testing.T) {
 
 	if err := agent.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// --- DelayRecorder tests ---
+
+// recordingDelayRecorder captures recorded delays per delivery.
+type recordingDelayRecorder struct {
+	mu     sync.Mutex
+	delays map[domain.DeliveryID]scripted.DelayRecord
+}
+
+func newRecordingDelayRecorder() *recordingDelayRecorder {
+	return &recordingDelayRecorder{
+		delays: make(map[domain.DeliveryID]scripted.DelayRecord),
+	}
+}
+
+func (r *recordingDelayRecorder) RecordDelay(deliveryID domain.DeliveryID, record scripted.DelayRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.delays[deliveryID] = record
+}
+
+func (r *recordingDelayRecorder) getDelays() map[domain.DeliveryID]scripted.DelayRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[domain.DeliveryID]scripted.DelayRecord, len(r.delays))
+	for k, v := range r.delays {
+		out[k] = v
+	}
+	return out
+}
+
+func TestAgent_DelayRecorder_RecordsResolvedDelays(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	codec, err := scripted.NewCodec(ctx)
+	if err != nil {
+		t.Fatalf("NewCodec error: %v", err)
+	}
+	planner := scripted.NewPlanner()
+	delayRecorder := newRecordingDelayRecorder()
+	reporter := newChannelReporter()
+	inventory := &nopInventory{}
+
+	agent := scripted.NewAgent(
+		reporter, inventory, codec, planner, ctx, testLogger,
+		scripted.WithDelayRecorder(delayRecorder),
+		scripted.WithSleep(func(ctx context.Context, d time.Duration) error { return nil }), // No-op sleep
+	)
+	t.Cleanup(func() {
+		if err := agent.Close(ctx); err != nil {
+			t.Errorf("Closing error: %v", err)
+		}
+	})
+
+	spec := json.RawMessage(`{
+		"behavior": {
+			"delivery": {
+				"acknowledgement": {
+					"latency": {"constant": "0.01s"}
+				},
+				"completion": {
+					"latency": {"constant": "0.02s"}
+				}
+			}
+		}
+	}`)
+
+	// Build manifest.
+	_, raw := wrapSpec(t, spec)
+	manifests := []domain.Manifest{{
+		ManifestType: scripted.ManagedManifestType,
+		Raw:          raw,
+	}}
+
+	// Deliver.
+	deliveryID := domain.DeliveryID(uuid.New().String())
+	gen := domain.Generation(1)
+	err = agent.Deliver(
+		ctx, scriptedTarget(), deliveryID, manifests,
+		domain.DeliveryAuth{}, nil, gen,
+	)
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	// Wait for async completion.
+	select {
+	case <-reporter.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for completion")
+	}
+
+	// Check recorded delays.
+	delays := delayRecorder.getDelays()
+	record, ok := delays[deliveryID]
+	if !ok {
+		t.Fatalf("no delay record for delivery %v", deliveryID)
+	}
+
+	if record.AckLatency != 10*time.Millisecond {
+		t.Errorf("ack latency = %v, want 10ms", record.AckLatency)
+	}
+	if record.CompletionLatency != 20*time.Millisecond {
+		t.Errorf("completion latency = %v, want 20ms", record.CompletionLatency)
+	}
+	t.Logf("Recorded delays: ack=%v, completion=%v", record.AckLatency, record.CompletionLatency)
+}
+
+func TestAgent_DelayRecorder_BoundedNormalLatency(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	codec, err := scripted.NewCodec(ctx)
+	if err != nil {
+		t.Fatalf("NewCodec error: %v", err)
+	}
+	planner := scripted.NewPlanner()
+	delayRecorder := newRecordingDelayRecorder()
+	reporter := newChannelReporter()
+	inventory := &nopInventory{}
+
+	agent := scripted.NewAgent(
+		reporter, inventory, codec, planner, ctx, testLogger,
+		scripted.WithDelayRecorder(delayRecorder),
+		scripted.WithSleep(func(ctx context.Context, d time.Duration) error { return nil }), // No-op sleep
+	)
+	t.Cleanup(func() {
+		if err := agent.Close(ctx); err != nil {
+			t.Errorf("Closing error: %v", err)
+		}
+	})
+
+	spec := json.RawMessage(`{
+		"behavior": {
+			"delivery": {
+				"acknowledgement": {
+					"latency": {
+						"bounded_normal": {
+							"min": "0.001s",
+							"max": "0.01s"
+						}
+					}
+				},
+				"completion": {
+					"latency": {
+						"bounded_normal": {
+							"min": "0.005s",
+							"max": "0.015s"
+						}
+					}
+				}
+			}
+		}
+	}`)
+
+	// Build manifest and deliver multiple times to see variance.
+	_, raw := wrapSpec(t, spec)
+	manifests := []domain.Manifest{{
+		ManifestType: scripted.ManagedManifestType,
+		Raw:          raw,
+	}}
+
+	for i := 0; i < 5; i++ {
+		gen := domain.Generation(i + 1)
+		deliveryID := domain.DeliveryID(fmt.Sprintf("test-%d", i))
+		err := agent.Deliver(
+			ctx, scriptedTarget(), deliveryID, manifests,
+			domain.DeliveryAuth{}, nil, gen,
+		)
+		if err != nil {
+			t.Fatalf("Deliver: %v", err)
+		}
+
+		// Wait for async completion.
+		select {
+		case <-reporter.done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for completion")
+		}
+	}
+
+	// Check recorded delays.
+	delays := delayRecorder.getDelays()
+	if len(delays) < 5 {
+		t.Errorf("got %d delay records, want 5", len(delays))
+	}
+
+	for i, record := range delays {
+		// Ack latency should be in [1ms, 10ms]
+		if record.AckLatency < 1*time.Millisecond || record.AckLatency > 10*time.Millisecond {
+			t.Errorf("delivery %v: ack latency = %v, want in [1ms, 10ms]", i, record.AckLatency)
+		}
+		// Completion latency should be in [5ms, 15ms]
+		if record.CompletionLatency < 5*time.Millisecond || record.CompletionLatency > 15*time.Millisecond {
+			t.Errorf("delivery %v: completion latency = %v, want in [5ms, 15ms]", i, record.CompletionLatency)
+		}
+		t.Logf("Delivery %v: ack=%v, completion=%v", i, record.AckLatency, record.CompletionLatency)
 	}
 }

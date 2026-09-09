@@ -27,6 +27,10 @@ type Agent struct {
 	// Tests inject a fake; production uses sleepCancellable.
 	sleep func(ctx context.Context, d time.Duration) error
 
+	// delayRecorder captures resolved delays for overhead measurement.
+	// The stress harness provides a real implementation; production passes NopDelayRecorder.
+	delayRecorder DelayRecorder
+
 	mu      sync.Mutex
 	slots   map[slotKey]*dispatchSlot
 	wg      sync.WaitGroup
@@ -54,6 +58,16 @@ func WithSleep(fn func(context.Context, time.Duration) error) AgentOption {
 	return func(a *Agent) { a.sleep = fn }
 }
 
+// WithDelayRecorder injects a DelayRecorder for capturing resolved delays.
+// The default is NopDelayRecorder.
+func WithDelayRecorder(recorder DelayRecorder) AgentOption {
+	return func(a *Agent) {
+		if recorder != nil {
+			a.delayRecorder = recorder
+		}
+	}
+}
+
 // NewAgent creates a scripted delivery agent. The codec must be
 // pre-compiled (NewCodec). The appCtx is the application-owned context
 // used to cancel in-flight work during shutdown.
@@ -67,13 +81,14 @@ func NewAgent(
 	opts ...AgentOption,
 ) *Agent {
 	a := &Agent{
-		reporter:  reporter,
-		inventory: inventory,
-		codec:     codec,
-		planner:   planner,
-		appCtx:    appCtx,
-		log:       log,
-		slots:     make(map[slotKey]*dispatchSlot),
+		reporter:      reporter,
+		inventory:     inventory,
+		codec:         codec,
+		planner:       planner,
+		appCtx:        appCtx,
+		log:           log,
+		delayRecorder: NopDelayRecorder{},
+		slots:         make(map[slotKey]*dispatchSlot),
 	}
 	// Set default sleep function (must be done before applying options).
 	a.sleep = a.sleepCancellable
@@ -143,9 +158,9 @@ func (a *Agent) dispatch(
 	generation domain.Generation,
 	operation Operation,
 ) error {
-	// Validate target.
-	if target.ID() != TargetID {
-		return fmt.Errorf("scripted: unexpected target %q, want %q", target.ID(), TargetID)
+	// Validate target type (target ID can vary depending on deployment context).
+	if target.Type() != TargetType {
+		return fmt.Errorf("scripted: unexpected target type %q, want %q", target.Type(), TargetType)
 	}
 
 	// Require exactly one manifest of the managed type.
@@ -213,7 +228,7 @@ func (a *Agent) dispatch(
 	a.slots[key] = slot
 	a.mu.Unlock()
 
-	// Plan acknowledgement.
+	// Plan acknowledgement and completion to capture their latencies for delay recording.
 	ackKey := AttemptKey{
 		InstanceKey: managedResourceInstanceKey(uid),
 		Generation:  gen,
@@ -222,18 +237,65 @@ func (a *Agent) dispatch(
 	}
 	ackDecision := a.planner.Decide(opSpec.Acknowledgement, ackKey)
 
-	// Wait for ack latency.
+	compKey := AttemptKey{
+		InstanceKey: managedResourceInstanceKey(uid),
+		Generation:  gen,
+		Operation:   operation,
+		Phase:       PhaseCompletion,
+	}
+	compDecision := a.planner.Decide(opSpec.Completion, compKey)
+
+	// Record resolved delays before launching async work.
+	a.delayRecorder.RecordDelay(deliveryID, DelayRecord{
+		AckLatency:        ackDecision.Latency,
+		CompletionLatency: compDecision.Latency,
+	})
+
+	// Start async ack and completion goroutine. The wg slot was reserved above.
+	// This allows Deliver to return immediately, matching the DeliveryAgent interface
+	// contract that Deliver returns on dispatch (infrastructure-level), not on ack outcome.
+	go a.runAckAndCompletion(deliveryID, generation, uid, envelope.Name, gen, operation, opSpec, spec.Inventory, ackDecision, compDecision, key)
+
+	return nil
+}
+
+func (a *Agent) runAckAndCompletion(
+	deliveryID domain.DeliveryID,
+	generation domain.Generation,
+	uid domain.ExtensionResourceUID,
+	name domain.ResourceName,
+	gen int64,
+	operation Operation,
+	opSpec OperationSpec,
+	inv InventoryProjection,
+	ackDecision PhaseDecision,
+	compDecision PhaseDecision,
+	key slotKey,
+) {
+	defer a.wg.Done()
+	defer a.releaseSlot(key)
+
+	ctx := a.appCtx
+
+	// Phase 1: Acknowledge -- sleep for ack latency, then report ack event.
+	// This runs asynchronously so Deliver() returns immediately to the caller,
+	// matching the DeliveryAgent interface contract.
 	if err := a.sleepCancellable(ctx, ackDecision.Latency); err != nil {
-		a.releaseSlot(key)
-		a.wg.Done()
-		return fmt.Errorf("scripted: ack wait cancelled: %w", err)
+		return // cancelled -- agent is shutting down
 	}
 
 	// Apply ack outcome.
 	if ackDecision.Outcome == OutcomeFailure {
-		a.releaseSlot(key)
-		a.wg.Done()
-		return fmt.Errorf("scripted %s acknowledgement failed", operation)
+		// Ack failed -- report failure without proceeding to completion.
+		// Return nil to allow the orchestration to retry with a fresh attempt.
+		failMsg := fmt.Sprintf("scripted %s acknowledgement failed", operation)
+		if err := a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
+			State:   domain.DeliveryStateFailed,
+			Message: failMsg,
+		}); err != nil {
+			a.log.Warn("scripted: report ack failure", "deliveryID", deliveryID, "error", err)
+		}
+		return
 	}
 
 	// Report acknowledgement progress event.
@@ -243,43 +305,11 @@ func (a *Agent) dispatch(
 		Kind:      domain.DeliveryEventProgress,
 		Message:   ackMsg,
 	}); err != nil {
-		a.releaseSlot(key)
-		a.wg.Done()
-		return fmt.Errorf("scripted: report ack event: %w", err)
+		a.log.Warn("scripted: report ack event", "deliveryID", deliveryID, "error", err)
+		return
 	}
 
-	// Start async completion. The wg slot was reserved above.
-	go a.runCompletion(deliveryID, generation, uid, envelope.Name, gen, operation, opSpec, spec.Inventory, key)
-
-	return nil
-}
-
-func (a *Agent) runCompletion(
-	deliveryID domain.DeliveryID,
-	generation domain.Generation,
-	uid domain.ExtensionResourceUID,
-	name domain.ResourceName,
-	gen int64,
-	operation Operation,
-	opSpec OperationSpec,
-	inv InventoryProjection,
-	key slotKey,
-) {
-	defer a.wg.Done()
-	defer a.releaseSlot(key)
-
-	ctx := a.appCtx
-
-	// Plan completion.
-	compKey := AttemptKey{
-		InstanceKey: managedResourceInstanceKey(uid),
-		Generation:  gen,
-		Operation:   operation,
-		Phase:       PhaseCompletion,
-	}
-	compDecision := a.planner.Decide(opSpec.Completion, compKey)
-
-	// Wait for completion latency.
+	// Phase 2: Completion -- sleep for completion latency, then report result.
 	if err := a.sleepCancellable(ctx, compDecision.Latency); err != nil {
 		return // cancelled -- agent is shutting down
 	}
@@ -324,6 +354,11 @@ func (a *Agent) projectInventoryWithRetry(
 	name domain.ResourceName,
 	inv InventoryProjection,
 ) error {
+	// If no inventory service, skip projection (e.g., in test harness with nil inventory).
+	if a.inventory == nil {
+		return nil
+	}
+
 	report := domain.InventoryDeltaReport{
 		ResourceType:  ResourceType,
 		Name:          name,
