@@ -7,25 +7,18 @@ FROM golang:1.25 AS fleetshift-builder
 
 WORKDIR /src
 
-# Copy go.mod/go.sum for both modules to cache deps
-# CLI has a replace directive pointing to ../server
+# Copy server module manifests to cache dependencies.
 COPY server/go.mod server/go.sum ./server/
-COPY cli/go.mod cli/go.sum ./cli/
 RUN --mount=type=cache,target=/go/pkg/mod \
-    cd server && go mod download && \
-    cd ../cli && go mod download
+    cd server && go mod download
 
-# Copy all source (server, cli)
+# Copy server source.
 COPY server/ ./server/
-COPY cli/ ./cli/
 
-# Build both binaries
+# Build server binary.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     cd server && CGO_ENABLED=0 go build -o /bin/fleetshift ./cmd/fleetshift
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    cd cli && CGO_ENABLED=0 go build -o /bin/fleetctl ./cmd/fleetctl
 
 FROM ${HYPERSHIFT_IMAGE} AS hypershift
 
@@ -36,7 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=fleetshift-builder /bin/fleetshift /usr/local/bin/fleetshift
-COPY --from=fleetshift-builder /bin/fleetctl /usr/local/bin/fleetctl
 COPY --from=hypershift /usr/bin/hypershift /usr/local/bin/hypershift
 
 EXPOSE 50051 8085

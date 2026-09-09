@@ -26,7 +26,11 @@ export const listCommand: CommandSpec = {
 };
 
 function listResources(response: unknown, collection: string): unknown {
-  if (Array.isArray(response) || response === null || typeof response !== "object") {
+  if (
+    Array.isArray(response) ||
+    response === null ||
+    typeof response !== "object"
+  ) {
     return response;
   }
   const objectResponse = response as Record<string, unknown>;
