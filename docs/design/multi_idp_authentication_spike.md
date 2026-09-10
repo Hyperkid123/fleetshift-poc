@@ -31,7 +31,7 @@ AuthorityConfig
   -> DeliveryPolicies
 ```
 
-`PrincipalAuthority` is a scheme plus authority identifier. For OIDC, the scheme is `oidc` and the authority identifier is the issuer. Other schemes can use their own authority identifier, such as a SPIFFE trust domain. The runtime lookup starts with this canonical authority because the incoming credential identifies its issuing authority before any tenant or policy resolution occurs.
+`PrincipalAuthority` is a scheme plus authority identifier. For OIDC, the scheme is `oidc` and the authority identifier is the issuer. Other schemes can use their own authority identifier, such as a SPIFFE trust domain. The runtime lookup starts with this standardized authority identifier because the incoming credential identifies its issuing authority before any tenant or policy resolution occurs.
 
 An OIDC credential method describes how credentials from one authority can authenticate:
 
