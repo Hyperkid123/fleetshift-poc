@@ -6,151 +6,90 @@
 
 ## Summary
 
-Resource Manager currently serves the web shell, plugin manifests, and plugin JavaScript from one merged local asset directory. This makes Resource Manager an authority over client code. A compromised Resource Manager could return modified client code and undermine the client trust model.
+Resource Manager currently serves shell, manifests, and plugin JavaScript from one merged local directory. This makes Resource Manager an authority over client code; a compromise can alter browser code and defeat client trust assumptions.
 
-This design separates browser asset delivery from Resource Manager while preserving one public browser origin. An independently trusted console gateway serves the shell and routes plugin asset requests to approved origins. Resource Manager stores and reconciles plugin metadata, but does not serve JavaScript bundles or control the gateway's trusted route policy. See [Discussion Note: Asset Ownership](#discussion-note-asset-ownership) for the ownership decision still under discussion.
-
-This distinction is essential. If Resource Manager can freely change gateway routes, it can point the browser at a malicious origin after compromise. In that design, the gateway is only an asset proxy, not an independent trust boundary. OME-313 requires the gateway's trusted asset policy to be controlled outside Resource Manager and to reject unauthorized route changes.
-
-The same model applies to core, community, and third-party plugins. The difference between them is deployment and ownership, not loading protocol.
-
-An explored alternative is documented in [Explored Alternative: Asset Distribution Addon](#explored-alternative-asset-distribution-addon).
+This design moves browser asset delivery out of Resource Manager while keeping one public browser origin. An immutable shell origin supplies bootstrap code. Console Gateway proxies dynamic plugin assets from approved origins. Client Asset Operator owns plugin discovery, approval, and integrity metadata. Resource Manager retains plugin metadata needed for RBAC and user settings, but cannot choose an asset origin or serve executable browser assets.
 
 ## Goals
 
-- Keep browser asset delivery outside Resource Manager.
-- Preserve one public origin for browser requests.
-- Support CDN, internal HTTP origin, air-gapped static host, and local development origins.
-- Avoid losing working plugin configuration when an origin is temporarily unavailable.
-- Discover plugin metadata at runtime rather than compiling a fixed registry into Resource Manager.
-- Support sandbox and cluster deployment with the same logical configuration.
-- Allow plugin development without rebuilding the complete shell and plugin set.
-- Define trust boundaries, caching, upgrades, and failure behavior.
+- Keep executable browser assets outside Resource Manager.
+- Keep one public browser origin across sandbox and cluster deployments.
+- Support CDN, internal HTTPS hosts, air-gapped static hosts, and scoped local development origins.
+- Discover plugin metadata at runtime and preserve last-known-good state during transient failure.
+- Support independent plugin development without rebuilding all shell and plugin assets.
+- Define trust, integrity, caching, upgrades, and failure behavior.
 
 ## Non-goals
 
-- Defining a complete addon marketplace or installation workflow.
-- Implementing native CLI plugin distribution.
-- Defining a storage-provider-specific implementation for S3 or OCI.
-- Changing the existing Scalprum plugin model or plugin contracts.
+- Marketplace, installation, or native CLI distribution design.
+- Changing Scalprum or Module Federation plugin contracts.
+- Storage-provider implementation details for S3, OCI, or caches.
+- OIDC issuer and identity-provider bootstrap design; see [IdP Bootstrap](idp_bootstrap.md).
+- Browser sandboxing for untrusted plugins. Same-origin plugins are trusted code.
 
 ## Current State
-
-The current proof of concept follows this flow:
 
 ```mermaid
 flowchart LR
     Build[Plugin builds] --> Merge[Merged web directory]
     Merge --> Image["/srv/web in FleetShift image"]
     Image --> RM["Resource Manager serves /app"]
-    RM --> Registry["Reads plugin-registry.json"]
+    RM --> Registry["plugin-registry.json"]
     Registry --> Config["/api/ui/config"]
-    Config --> Browser[Browser loads manifests and bundles]
+    Config --> Browser[Browser]
 ```
 
-Current constraints:
+- `plugin-registry.json` is build-generated.
+- Resource Manager reads it from `WebDir` and serves API and static assets.
+- Assets effectively use `/app` as their only origin.
+- AIO already provides a public proxy for Dex and Resource Manager.
 
-- `plugin-registry.json` is generated during the build.
-- Resource Manager reads the registry from `WebDir` on request.
-- Resource Manager serves both API traffic and static assets.
-- Asset origins are effectively hard-coded to `/app`.
-- AIO has a separate reverse proxy process, but it currently routes Dex and Resource Manager only.
-- The existing addon UI design already describes external manifest and asset URLs, but this is not yet the runtime deployment path.
-
-## Target Architecture
+## Architecture
 
 ```mermaid
 flowchart TB
-    Definitions[Resource definitions<br/>YAML / CRD / API] --> Policy[Gateway policy<br/>origins, routes, enabled plugins]
-    Policy --> Gateway[Console Gateway<br/>public origin]
-    Authority[Independent deployment/admin authority] --> Policy
-    Gateway -. sanitized plugin catalog .-> RM[Resource Manager<br/>catalog reconciler<br/>persisted sanitized state]
-    Browser[Browser] --> Gateway
-    Gateway -->|authenticated /api/*| RMAPI["Resource Manager API"]
-    Gateway -->|/client/web| Shell["Approved shell/core origin"]
-    Gateway -->|/client/web/plugins| CDN["Approved plugin origins/CDNs"]
-    Gateway -->|developer override| Dev[Explicitly approved developer origin]
+    Policy[PluginClientPolicy<br/>deployment authority] --> Operator[Client Asset Operator<br/>discovery + integrity]
+    Operator -->|policy + integrity| Gateway[Console Gateway<br/>dynamic plugin assets]
+    Operator -->|sanitized catalog| RM[Resource Manager<br/>RBAC + user settings]
+    Browser[Browser] --> Edge[OpenShift Route / AIO edge]
+    Edge -->|/client/web/ + /client/shell/*| Shell[Immutable shell origin]
+    Edge -->|/client/web/plugins/*| Gateway
+    Edge -->|authenticated /api/*| RM
+    Gateway -->|approved upstream| Origin[CDN, static host, or developer server]
 ```
 
-The browser uses one public origin. It does not contact third-party CDNs or plugin origins directly. Console Gateway owns plugin resource definitions, manifest discovery, trusted origin selection, route policy, and global plugin availability. Resource Manager does not load or own those definitions. It receives a sanitized plugin catalog from Console Gateway, persists that catalog for resilience, and uses it for RBAC and user-specific settings. Resource Manager cannot modify gateway policy.
+The browser uses one public origin and never accesses plugin origins directly. Edge routes immutable shell assets, dynamic plugin assets, and APIs by path. Resource Manager is not on the asset path and cannot create or change trusted plugin routes.
 
-The gateway performs plugin discovery itself. It fetches manifests only from origins already approved by gateway policy, validates them, and exposes a read-only internal discovery endpoint to Resource Manager. That endpoint returns logical and non-sensitive metadata, such as plugin key, name, version, capabilities, dependencies, and availability. It does not grant Resource Manager authority over origins, credentials, mutable route policy, or gateway configuration.
+### Path ownership
 
-### Browser origin versus upstream origins
+| Path | Owner | Authentication | Purpose |
+| --- | --- | --- | --- |
+| `/client/web/` | Immutable shell origin | Public | Shell HTML and entry assets |
+| `/client/shell/*` | Immutable shell origin | Public | Content-hashed shell assets |
+| `/client/web/config` | Shell/edge | Public | Global plugin and OIDC bootstrap configuration |
+| `/client/web/plugins/*` | Console Gateway | Public | Approved manifests, JavaScript, CSS, chunks |
+| `/api/*` | Resource Manager | Required | Platform APIs, user settings, plugin data |
+| `/idp/*` | IdP proxy or IdP | Public as required by OIDC | OIDC discovery and login exchange |
 
-“Separate deployment” describes workload and trust separation, not browser URL separation. The browser should normally call one public origin:
+`/client/*` is reserved for client discovery and bootstrap. `/api/*` remains Resource Manager's authenticated domain API namespace. `/client/cli/config` is reserved for future CLI configuration; it does not imply CLI asset delivery through browser routes.
 
-```mermaid
-flowchart LR
-    Browser[Browser] --> App[https://console.example.com/client/web/]
-    Browser --> Plugin[https://console.example.com/client/web/plugins/gcphcp/...]
-    Browser --> API[https://console.example.com/api/...]
-    App --> Gateway[Console Gateway]
-    Plugin --> Gateway
-    API --> Gateway
-```
+### Ownership
 
-The gateway then forwards requests over private or controlled upstream connections:
+| Component | Owns | Must not own |
+| --- | --- | --- |
+| Deployment authority | Plugin policy and shell trust anchor | Resource Manager-managed route policy |
+| Client Asset Operator | Manifest discovery, validation, integrity catalog | Browser asset serving or user authorization |
+| Immutable shell origin | Bootstrap HTML, shell assets, global config assembly | Dynamic upstream route selection |
+| Console Gateway | Plugin route enforcement, fetch, byte validation, optional cache | Initial plugin trust policy or API authorization |
+| Resource Manager | Sanitized catalog persistence, RBAC, user settings | Plugin origins, gateway routes, browser bundle serving |
 
-```mermaid
-flowchart TB
-    Browser[Browser<br/>one public origin] --> Gateway[Console Gateway]
-    Gateway -->|private network| RMAPI[Resource Manager API]
-    Gateway -->|approved upstream| CDN[CDN or static asset host]
-    Gateway -->|approved upstream| Dev[Developer server]
-```
+## Policy and Discovery
 
-The browser does not need to know whether Resource Manager, the CDN, or the console gateway runs in the same pod, a separate process, or a separate cluster Deployment. Keeping one browser origin also avoids exposing third-party CDN origins to browser policy, network restrictions, and plugin code.
-
-Direct browser access to an asset CDN is possible only as an explicit weaker deployment mode. It is not the recommended default because it bypasses the gateway's origin policy and audit point.
-
-The same rule applies to UI bootstrap configuration. Resource Manager may provide plugin metadata, but it cannot introduce arbitrary origins through the target `/client/web/config` endpoint. The console gateway validates every plugin origin and path against its independent policy. An unknown origin, unapproved path prefix, or plugin-to-origin mismatch is rejected. The gateway may also rewrite valid plugin metadata to same-origin `/client/web/plugins/...` URLs before returning the configuration to the browser. The browser must never receive an unvalidated direct origin from Resource Manager. The ownership alternative is described in [Discussion Note: Asset Ownership](#discussion-note-asset-ownership).
-
-The console gateway does not need to proxy every Resource Manager API request to enforce this rule. The gateway is the trust boundary for browser assets and global UI bootstrap, not the business authorization boundary for platform APIs. AIO or OpenShift ingress may route authenticated `/api/...` requests directly to Resource Manager while routing `/client/web/`, `/client/web/plugins/...`, and global `/client/web/config` to the console gateway.
-
-The console gateway can own global `/client/web/config` and use deployment-approved policy plus Resource Manager discovery/status. User-specific configuration, such as navigation visibility, plugin visibility, navigation order, or workspace-dependent plugin access, remains behind an authenticated Resource Manager endpoint. Persisted user preferences belong under the API/domain namespace, such as `/api/user/preferences` or `/api/user/settings`. The browser-facing effective projection can be exposed separately as read-only `/api/user/settings`. This projection should contain logical plugin IDs and user layout data, not arbitrary asset origins or gateway routes. Resource Manager continues to enforce authorization on every API and data request regardless of which plugins are visible.
-
-Plugin discovery is global and public. The gateway publishes the complete approved plugin catalog through `/client/web/config`; knowing that a plugin could exist does not grant access to its data or operations. Resource Manager uses authenticated `/api/user/settings` only for user preferences, such as enabled or disabled plugins, navigation layout, and navigation order. The browser intersects those preferences with the global catalog when deciding what to render. The gateway does not need a per-user route table or a per-user asset configuration push. Plugin APIs still enforce authorization independently; hiding a plugin through user preferences is a UX choice, not the security boundary.
-
-### Client configuration namespace
-
-The target design should reserve `/client/*` for client-facing configuration and discovery rather than placing global bootstrap configuration under `/api`. `/api` remains the namespace for Resource Manager platform APIs and user settings. Web and CLI are both user interfaces, but they are different clients with different runtimes and configuration needs. The client type is represented below `/client/`, for example:
-
-```text
-/client/web/config
-/client/cli/config
-```
-
-`/client/web/config` contains global browser bootstrap and plugin configuration. `/api/user/settings` contains the authenticated, read-only effective web UI configuration generated by Resource Manager. Persisted user preferences and settings use API/domain endpoints such as `/api/user/preferences`; those endpoints own updates and storage. `/client/cli/config` is reserved for future CLI discovery and configuration; it does not imply that the CLI consumes browser manifests or JavaScript assets. Future client types can use additional `/client/<type>/...` paths without changing the `/api` namespace.
-
-The current `/api/ui/...` endpoints are the proof-of-concept shape. Migration to `/client/...` is a namespace cleanup and does not change the Scalprum plugin model.
-
-The console gateway owns browser asset traffic, trusted origin selection, plugin policy, manifest discovery, and final global web configuration publication. Resource Manager owns a persisted last-known-good sanitized catalog received from the gateway and uses it for RBAC and user-specific settings. Resource Manager cannot introduce or change an origin. See [Discussion Note: Asset Ownership](#discussion-note-asset-ownership) for the unresolved ownership boundary.
-
-### Authentication bootstrap and public assets
-
-The browser cannot authenticate before it can load the code that performs authentication. The following web resources must therefore be available without a user session:
-
-- Shell HTML and JavaScript under `/client/web/`.
-- Approved plugin manifests and JavaScript/CSS under `/client/web/plugins/...`.
-- Global `/client/web/config`.
-- The identity-provider configuration required to start login, including issuer or authority, authorization endpoint, client ID, and scope.
-
-Global `/client/web/config` must not require a bearer token. It needs to provide enough OIDC configuration for the browser to redirect the user to the identity provider and obtain a token. The console gateway can serve this configuration directly or proxy a public bootstrap response, but it must still enforce trusted plugin policy before returning plugin data.
-
-The public boundary is intentional: `/client/web/`, `/client/web/plugins/...`, and `/client/web/config` are available without a user session. Every `/api/...` endpoint requires authentication and authorization. Infrastructure health and readiness probes, if needed, must use separately named operational endpoints rather than unauthenticated API routes. After login, the browser sends the access token to `/api/user/settings` and other Resource Manager APIs. User-specific plugin visibility, navigation settings, and data access are evaluated only through the authenticated API surface.
-
-The internal gateway discovery endpoint is different from public browser configuration. It must not be exposed anonymously; it requires service-to-service authentication and authorization between the console gateway and Resource Manager. Public assets being unauthenticated does not make plugin data unauthenticated. Plugin APIs must continue enforcing user, tenant, workspace, and role authorization independently.
-
-## Gateway Plugin Policy Resource
-
-The deployment should define one policy resource for every browser plugin. This resource is loaded by Console Gateway, not Resource Manager. It can be represented as YAML in sandbox mode and as a CRD, ConfigMap, Secret, or equivalent deployment-owned configuration in cluster mode. It contains the authoritative asset origin, manifest location, route prefix, and enablement policy.
-
-Conceptual shape:
+Deployment defines one `PluginClientPolicy` per plugin identity. YAML is suitable for AIO. A namespace-scoped CRD is preferred for cluster deployment. The resource shares plugin identity across clients while each client declares its own artifact details.
 
 ```yaml
 apiVersion: ui.fleetshift.io/v1alpha1
-kind: PluginRoutePolicy
+kind: PluginClientPolicy
 metadata:
   name: gcphcp
 spec:
@@ -158,526 +97,189 @@ spec:
     name: gcphcp-plugin
     key: gcphcp
     version: 1.2.0
-  origin: https://assets.example.com/gcphcp/1.2.0
-  manifestPath: plugin-manifest.json
-  routePrefix: /client/web/plugins/gcphcp
-  enabled: true
-  required: false
+  policyRevision: 1
+  clients:
+    web:
+      origin: https://assets.example.com/gcphcp/1.2.0/web
+      manifestPath: plugin-manifest.json
+      routePrefix: /client/web/plugins/gcphcp/1.2.0
+      enabled: true
+      required: true
+      onFailure: block-client
+    cli:
+      artifact: oci://registry.example.com/gcphcp-cli:1.2.0
+      manifestPath: cli-manifest.json
+      enabled: true
+      required: false
+      onFailure: disable-client
 ```
 
-The final API shape remains open. At minimum, the resource must identify:
+Required policy fields:
 
-- Stable plugin key and name.
-- Plugin version.
-- Manifest location.
-- Asset origin.
-- Public route prefix.
-- Required versus optional behavior.
-- Optional dependencies and compatibility constraints.
-- Optional signature or provenance information.
+- Stable plugin key, name, and version.
+- Client artifact locations and route prefix for each supported client type.
+- Enabled, required, and failure behavior per client artifact.
+- Optional dependencies, compatibility, signature, or provenance constraints.
 
-Console Gateway validates the origin, manifest path, asset path, and public route before publishing the plugin. Resource Manager receives only the resulting sanitized catalog and must not be the authority that adds or changes an origin in the trusted set.
+Operator loads policy, fetches manifests only from approved origins, validates identity/version/path/client type, and verifies integrity metadata generated by Rspack/CI and published in `plugin-manifest.json`. It may compute hashes as a fallback or discovery aid, but build-time hashes provide the preferred provenance chain before CAO fetches the asset. Operator atomically publishes active state, supplies full policy and integrity metadata read-only to Gateway, and supplies a sanitized logical catalog to Resource Manager.
 
-## Catalog Persistence
+The sanitized catalog can include identity, version, availability, capabilities, dependencies, extension types, logical module identifiers, and opaque policy references. It must not include mutable route authority, storage credentials, or browser URLs that bypass Gateway.
 
-Resource Manager persists a runtime catalog received from Console Gateway. It does not persist or become authoritative for gateway policy definitions.
+Community publishers need not manage signing keys. Deployment admission establishes approval. Publisher signatures or provenance are optional additional evidence. An observed hash on first fetch is trust-on-first-use: it detects later change but does not prove first bytes were clean. Strong deployments pin expected digests or require signed integrity metadata.
 
-The gateway policy is authoritative for whether a plugin is available globally. The Resource Manager catalog is a last-known-good sanitized cache that allows RBAC and user-specific configuration to continue operating when the gateway or an asset origin is temporarily unavailable.
+## Configuration and Authorization
 
-Conceptual catalog fields:
+The shell/edge produces public `/client/web/config` from deployment OIDC configuration plus active operator catalog data. It contains global, approved plugin metadata and same-origin plugin URLs. It must not expose unvalidated upstream origins.
 
-- Plugin identity and version.
-- Gateway policy key or opaque route reference.
-- Validated manifest contents.
-- Last successful validation time.
-- Last attempted validation time.
-- Current availability state.
-- Last failure reason.
-- Signature or provenance result, when used.
+Resource Manager serves authenticated `/api/user/settings`. It holds user preferences, navigation order, workspace-dependent presentation, and authorized plugin visibility as logical plugin identifiers. Browser renders a plugin only when it appears in both global configuration and user settings. This improves UX; Resource Manager still enforces authorization on every API request.
 
-JavaScript and CSS bundles are not stored in Resource Manager. The gateway may cache them according to its deployment policy.
+Plugin capabilities and dependencies describe availability only. They cannot grant access to organization, tenant, workspace, role, or user data.
 
-## Discovery and Reconciliation
+`/client/web/config` is public because browser code needs it before login. All `/api/*` paths require authentication and authorization. Do not create unauthenticated API exceptions for plugin bootstrap. If a future pre-login proof is required, design a separate public path and trust anchor.
 
-Discovery is a reconciler, not a blocking one-shot startup operation.
+## Trust and Integrity
 
-### Startup
+Same-origin plugins are part of browser trusted computing base. They can inspect page state, make authenticated same-origin API requests, and may access non-HttpOnly browser storage. RBAC protects API responses, not against malicious approved plugin code. Only artifacts with a positive deployment trust decision can receive same-origin routes.
 
-1. Console Gateway loads deployment-owned `PluginRoutePolicy` resources.
-2. Console Gateway loads its last-known-good manifest and route state.
-3. Console Gateway fetches and validates manifests from approved origins.
-4. Console Gateway publishes global `/client/web/config` from validated state.
-5. Resource Manager loads its persisted sanitized catalog.
-6. Resource Manager consumes the gateway's sanitized discovery catalog.
-7. Resource Manager generates authenticated `/api/user/settings` from that catalog and its authorization data.
-8. Both components retry their own failed refreshes asynchronously.
+Gateway must:
 
-Resource Manager should not lose its sanitized plugin information because one origin is down or one manifest is malformed. Console Gateway should not lose its last-known-good global configuration for the same reason.
+- Match requests to operator-approved plugin, version, path prefix, and origin.
+- Normalize paths and reject overlap, traversal, unexpected schemes, and credential-bearing URLs.
+- Use verified HTTPS upstreams; allow HTTP only for explicit sandbox developer policy.
+- Reject redirects by default to prevent SSRF and origin escapes.
+- Block outbound requests to loopback, RFC1918/private address ranges, link-local addresses including `169.254.169.254`, and other deployment-defined metadata or internal service endpoints.
+- Strip `Cookie`, `Authorization`, forwarding, client-certificate, and identity headers from asset requests.
+- Validate fetched bytes against operator-provided digests before serving them.
+- Record route and policy audit events; bound timeout, retry, and cache behavior.
 
-### Per-resource reconciliation
+Gateway does not proxy platform APIs. Edge routes authenticated `/api/*` directly to Resource Manager, preserving only required authentication and removing client-spoofable forwarding headers.
+
+### Shell trust and out-of-band proof
+
+Gateway byte validation protects against an altered upstream. It cannot protect against a compromised Gateway that can replace the verifier. The initial shell must therefore be independently trusted.
+
+| Layer | Protects against | Trust anchor |
+| --- | --- | --- |
+| Immutable shell | Gateway replacing bootstrap/verifier | Deployment-owned immutable shell origin or edge-pinned artifact |
+| Direct API proof | Gateway changing dynamic plugin bytes | Operator-signed integrity metadata fetched from authenticated `/api/*` |
+
+Trusted shell code fetches an operator-signed integrity proof directly from Resource Manager, verifies it with a shell-anchored public key, and supplies expected SRI values before Module Federation creates dynamic scripts. Resource Manager distributes this proof but does not own signing keys. Shell and plugin Rspack/Webpack configurations must set `output.crossOriginLoading = "anonymous"` so standard dynamic chunks use the same CORS/SRI contract as remote entries. If plugins must load before login, that integrity flow needs a separate explicitly designed public bootstrap path.
+
+Module Federation remote entries require runtime support because URL and version are discovered dynamically. Shell runtime must attach SRI to remote scripts and plugin chunks, for example through an equivalent runtime hook:
+
+```js
+export const sriRuntimePlugin = () => ({
+  name: "sri-runtime-plugin",
+  createScript({ url }) {
+    const script = document.createElement("script");
+    script.src = url;
+    script.crossOrigin = "anonymous";
+    const integrity =
+      globalThis.__GLOBAL_PLUGIN_CONFIG__?.getIntegrityForUrl(url);
+    if (integrity) script.integrity = integrity;
+    return script;
+  },
+});
+```
+
+This is runtime integration guidance, not another policy contract. Existing Scalprum/Module Federation integration must gain equivalent support before browser SRI protects runtime remote entries.
+
+CSP is defense in depth, not plugin isolation. Deployment should restrict browser sinks to self where plugin behavior permits, including `connect-src 'self'`, `img-src 'self'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, and `frame-src 'none'`. Proxy OIDC discovery and token exchange through console origin where practical; never use wildcard IdP origins. Prefer short-lived access tokens held in memory or a dedicated Web Worker, not `localStorage` or `sessionStorage`; this reduces exposure but does not isolate malicious same-origin code.
+
+Operator, Gateway, and Resource Manager catalog paths require encrypted, mutually authenticated service transport. Prefer platform/service-mesh mTLS. Otherwise use cert-manager or equivalent deployment PKI with distinct workload identities. Resource Manager must not control the trust bundle. AIO may use equivalent short-lived certificates or protected Unix sockets.
+
+## Reconciliation and Failure Behavior
+
+Discovery is asynchronous reconciliation, not a startup gate.
+
+1. Operator loads deployment policy and validates manifests and integrity.
+2. Operator publishes active policy/integrity state to Gateway and sanitized catalog to Resource Manager.
+3. Shell/edge publishes global configuration from active state.
+4. Resource Manager persists catalog and creates authenticated user settings.
+5. Each component refreshes failed dependencies asynchronously.
 
 | Condition | Result |
 | --- | --- |
-| Gateway policy unchanged and cached state valid | Continue using cached state |
-| Gateway policy changed and manifest validates | Atomically replace gateway state and sanitized catalog |
-| Origin temporarily fails | Keep prior state active and record internal stale status |
-| No cached state and fetch fails | Mark unavailable; continue startup |
-| Manifest is permanently invalid | Keep prior state if present; report error |
-| Plugin is absent from gateway policy | Remove from global catalog and active routes |
-| Plugin is disabled in gateway policy | Remove from global catalog and active routes |
+| Valid policy and manifest update | Atomically activate replacement state |
+| Temporary origin or manifest failure | Keep policy-bound last-known-good state and report stale |
+| Invalid manifest | Keep prior valid state, if any; report validation error |
+| No valid cached state | Plugin unavailable; console starts |
+| Policy origin/revision change | Revoke old route before activating new route |
+| Policy removed, disabled, expired, or explicitly revoked | Remove route and global catalog entry immediately |
 
-An entry absent from gateway policy must not remain globally active merely because cached metadata exists. Cache is fallback for failure, not an independent authorization source. A temporary fetch or reconciliation failure must not make an otherwise working plugin disappear. Active last-known-good state remains visible until the plugin is explicitly disabled or removed from gateway policy.
+Last-known-good state is a temporary availability fallback, not independent authorization. It remains usable only while its originating policy is current and unexpired. Status must expose last success, last failure, next retry, consecutive failures, and stale state.
 
-### Retry behavior
+## Caching and Upgrades
 
-Retries should use bounded exponential backoff with jitter. The reconciler should expose status for:
+- Manifests and `/client/web/config`: revalidate, no-cache, or explicit versioning.
+- `/api/user/settings`: `Cache-Control: no-store`; never shared across users or workspaces.
+- Shell and plugin JS/CSS: content-hashed names plus long-lived immutable cache headers.
+- Gateway route state: persistent and recoverable.
 
-- Last successful refresh.
-- Last failed attempt.
-- Next retry time.
-- Number of consecutive failures.
-- Whether active data is stale and still serving last-known-good state.
+Version directories alone are insufficient: immutable cache headers require content-hashed filenames. Build must validate hashed shell and plugin outputs. Asset hosts retain old entrypoints and lazy chunks through active-session, cache propagation, and rollback windows.
 
-Stale means that active plugin metadata could not be refreshed from its configured origin or gateway policy source. It does not mean that the plugin is removed or unavailable to users. Users should continue seeing and using a working last-known-good plugin. Administrators should see freshness, retry, and validation failure status so they can diagnose the condition. A plugin should disappear only when it is explicitly removed or disabled from gateway policy, or when it has never had a valid configuration.
+Upgrade sequence: publish assets, validate through Operator, atomically publish route/catalog state, then retain prior content-hashed assets. Rollback changes policy to a previously validated version; it does not rebuild Resource Manager.
 
-The initial design assumes startup load plus background reconciliation. A full dynamic watch mechanism can be added later without changing the resource or catalog model.
-
-## Runtime UI Configuration Generation
-
-The build-time `plugin-registry.json` is not the target runtime source of truth. The gateway's reconciled policy and manifest catalog become the input to global runtime UI configuration generation. Resource Manager receives a sanitized copy for authorization and user-specific settings.
-
-After each catalog or trusted-policy change, the runtime configuration builder should:
-
-1. Read active, validated, and policy-approved plugin entries.
-2. Build global Scalprum configuration from those entries.
-3. Generate plugin pages, module entries, labels, and other global plugin metadata.
-4. Resolve each logical plugin identity and policy key to the gateway-approved manifest and asset routes.
-5. Atomically publish a new immutable-in-memory configuration snapshot.
-
-The console gateway serves the current snapshot through `/client/web/config`. The preferred implementation is for the gateway to perform the final merge of logical activation state and trusted route policy. Resource Manager may produce a candidate logical metadata snapshot, but the gateway must validate or rewrite all resolved asset references before serving it. The response should be no-cache or explicitly versioned because it changes when plugin resources reconcile. A failed reconciliation must leave the previous valid snapshot active; a single unavailable optional plugin must not make global UI configuration unavailable.
-
-This global snapshot is separate from authenticated `/api/user/settings`. Resource Manager reads persisted preferences from API/domain storage, evaluates authorization, and generates user-specific plugin visibility, navigation layout, navigation order, and workspace-specific settings on request. Those settings contain logical plugin identifiers and presentation data, not asset origins or gateway routes. No per-user route configuration needs to be pushed into the console gateway.
-
-The browser combines the two views by logical plugin identity. The gateway supplies the globally approved and available plugin set through `/client/web/config`; Resource Manager supplies the authorized user-specific set through `/api/user/settings`. A plugin is rendered only when it appears in both sets. This prevents Resource Manager from making an unapproved origin loadable and prevents a globally approved plugin from appearing for a user who is not authorized to use it.
-
-The current `/api/ui/config` handler reads the build-time registry directly. Migration work must replace that read path with the runtime catalog and snapshot builder rather than simply moving `plugin-registry.json` to a new URL.
-
-### Gateway discovery endpoint
-
-The internal discovery endpoint should be private to the deployment and authenticated between Console Gateway and Resource Manager. It is a read-only data path from gateway to Resource Manager. It should return only the metadata Resource Manager needs for catalog reconciliation and RBAC evaluation:
-
-- Stable plugin key and name.
-- Version and availability state.
-- Declared capabilities and dependencies.
-- Validated manifest extension types and logical module identifiers.
-- Policy key or opaque gateway-owned reference.
-
-It should not return:
-
-- An authority to register or replace origins.
-- Gateway credentials or storage credentials.
-- Mutable route policy.
-- Browser-facing URLs that bypass gateway validation.
-
-Resource Manager can use this catalog to calculate `/api/user/settings`. The gateway remains responsible for fetching manifests, resolving origins, generating or finalizing `/client/web/config`, and serving browser assets.
-
-## Gateway Manifest Validation
-
-Console Gateway validates manifests before publishing a plugin to its global catalog or sanitized catalog endpoint. Validation should include:
-
-- Manifest is valid JSON and matches expected schema.
-- Manifest plugin name matches the gateway policy resource.
-- Version matches the gateway policy resource or accepted version policy.
-- Referenced scripts resolve below the configured asset origin.
-- No credential-bearing URLs are accepted.
-- No unexpected schemes are accepted.
-- Route and origin do not overlap another plugin unexpectedly.
-- Declared extension references satisfy platform rules.
-- Signature or provenance validates when required by deployment policy.
-
-Validation failure must not replace a previously validated active entry unless the gateway policy resource was removed or disabled.
-
-## Console Gateway
-
-The gateway is an independent browser-facing component. It may be implemented using an existing gateway/proxy technology or a small dedicated process for sandbox deployments. It must not require custom code for each plugin.
-
-Example routing:
-
-```mermaid
-flowchart LR
-    Request[Browser request] --> Gateway[Console Gateway]
-    Gateway -->|/client/web| Shell["Configured shell origin"]
-    Gateway -->|/client/web/plugins/core| Core["Configured core origin"]
-    Gateway -->|/client/web/plugins/kind| Kind["Configured Kind origin"]
-    Gateway -->|/client/web/plugins/gcphcp| GCPHCP["Configured GCPHCP origin"]
-    Gateway -->|/client/web/plugins/developer| Localhost["Configured localhost origin"]
-    Gateway -->|authenticated /api/*| RM["Resource Manager"]
-```
-
-Core and community plugins use identical routing. Core plugins may be hosted on the same company CDN as community plugins.
-
-The public path is intentionally independent from upstream layout. Console Gateway may rewrite `/client/web/` to a shell origin's `/app/` directory and `/client/web/plugins/gcphcp/...` to the approved GCPHCP origin's relative asset path. This allows the public client namespace to remain consistent without requiring every asset host or existing bundle to be rebuilt immediately.
-
-The gateway is responsible for:
-
-- Public TLS and same-origin browser access.
-- Static asset serving where configured.
-- Reverse proxying to HTTP(S) origins.
-- Route isolation and path normalization.
-- Upstream TLS verification.
-- Origin and route allowlists.
-- Timeouts, bounded retries, and failure responses.
-- Cache headers and optional local caching.
-- Access and routing audit logs.
-
-Console Gateway publishes sanitized plugin discovery results and status to Resource Manager. Resource Manager must not be able to expand the gateway's trusted origin set by itself.
-
-The sanitized catalog may contain logical metadata such as:
-
-```json
-{
-  "plugin": "gcphcp",
-  "version": "1.2.0",
-  "enabled": true
-}
-```
-
-This catalog is a read-only observation of gateway policy and discovery. It does not give Resource Manager authority to choose the asset origin. The distinction is:
-
-```text
-Trusted gateway policy:
-  Is gcphcp approved?
-  Which origin and path may serve it?
-
-Resource Manager:
-  Which authorized users may see gcphcp?
-  Which version and capabilities are available to user configuration?
-```
-
-The gateway activates and publishes a plugin only when its own policy and manifest validation succeed. A compromised Resource Manager can alter its local sanitized catalog or user settings, but cannot introduce an unknown origin, replace a trusted origin, or change a route prefix in the gateway.
-
-The gateway must obtain trusted route policy through an independent mechanism, such as:
-
-- A deployment-owned mounted configuration or Secret.
-- A configuration service controlled by the deployment administrator.
-- A signed route policy whose signing key is unavailable to Resource Manager.
-- A gateway-native control plane with independent authorization.
-
-### Deployment-owned configuration
-
-The gateway can receive its route policy from a file or Secret mounted only into the gateway process:
-
-```yaml
-routes:
-  gcphcp:
-    origin: https://cdn.example.com/gcphcp
-    pathPrefix: /client/web/plugins/gcphcp
-  core:
-    origin: https://cdn.example.com/core
-    pathPrefix: /client/web/plugins/core
-```
-
-Resource Manager cannot modify this policy when the deployment gives the gateway a separate service identity, mounts the file only into the gateway, and prevents Resource Manager from updating the Secret or configuration source.
-
-This is the recommended first model for fixed deployment configuration: local policy YAML in sandbox and a gateway-only ConfigMap or Secret in cluster mode.
-
-### Administrator-controlled configuration service
-
-The gateway can read policy from a separate service controlled by the deployment administrator:
-
-```text
-Administrator or deployment controller
-    -> route-policy service
-    -> Console Gateway
-```
-
-Resource Manager reports that `gcphcp` version `1.2.0` is enabled. The gateway asks the route-policy service where that version may be served from. Resource Manager has no write access to the route-policy service.
-
-This is useful when administrators need to update routes without editing mounted files.
-
-### Signed route policy
-
-An administrator or trusted deployment pipeline can create a signed policy:
-
-```json
-{
-  "plugin": "gcphcp",
-  "version": "1.2.0",
-  "origin": "https://cdn.example.com/gcphcp/1.2.0",
-  "pathPrefix": "/client/web/plugins/gcphcp"
-}
-```
-
-The gateway trusts a verification key that Resource Manager cannot use for signing. It verifies the signature, plugin identity, version, origin, path binding, and optional expiration before accepting the policy.
-
-This is useful when policy must be distributed across environments or when cryptographic provenance is required.
-
-### Gateway-native control plane
-
-When the selected gateway provides a dynamic configuration API, an administrator or deployment controller can configure routes directly:
-
-```text
-Administrator or deployment controller
-    -> gateway control API
-    -> Console Gateway route table
-```
-
-Resource Manager remains outside route authorization. It can expose plugin availability, but the gateway control plane decides whether a route exists.
-
-This is useful when using Envoy, an ingress controller, or another gateway with established dynamic configuration and authorization.
-
-The gateway must reject malformed, unsigned, unauthorized, or policy-violating route updates. A failed update must leave the previous known-good gateway policy active.
-
-If Resource Manager is compromised, the expected outcomes are:
-
-- Unknown plugin: rejected.
-- Unknown origin: rejected.
-- Wrong path on an approved origin: rejected.
-- Changed version without approved policy: rejected or held at last-known-good version.
-- Disabled plugin: remains inactive.
-
-## Gateway Extensibility
-
-The initial upstream contract should be HTTP(S). This covers CDNs, nginx, object-storage gateways, S3-compatible public endpoints, and local developer servers.
-
-The gateway should not expose object-storage credentials to browsers. For S3, the preferred deployment is a CDN or HTTPS static gateway in front of the bucket.
-
-If a deployment requires private or encrypted object storage, use a separate gateway-side fetcher or storage adapter. Do not add arbitrary executable proxy plugins to Resource Manager. Arbitrary proxy extensions would expand the trusted computing base and weaken the separation this design is intended to provide.
-
-Possible future extension points:
-
-- Declarative HTTP(S) upstreams.
-- Gateway-side object-storage fetcher.
-- Signed dynamic route configuration.
-- Deployment-specific cache or content verification adapter.
-
-## Deployment Models
+## Deployment
 
 ### Sandbox AIO
 
 ```mermaid
-flowchart TB
-    S6[s6 supervisor] --> RM[Resource Manager process]
-    S6 --> Gateway[Console gateway process]
-    S6 --> Dex[Dex process]
+flowchart LR
+    Browser --> AIO[AIO proxy<br/>public TLS edge]
+    AIO -->|/idp/*| Dex[Dex]
+    AIO -->|/client/web/, /client/shell/*, /client/web/config| Shell[Immutable shell process]
+    AIO -->|/client/web/plugins/*| Gateway[Console Gateway process]
+    AIO -->|/api/*| RM[Resource Manager]
+    Operator[Client Asset Operator] -->|policy + integrity| Shell
+    Operator -->|policy + integrity| Gateway
+    Operator -. sanitized catalog .-> RM
 ```
 
-Sandbox has no OpenShift Route or Service. The existing AIO proxy remains the public TLS edge and routes only the browser paths that require console-gateway handling to a separate local console-gateway process:
+AIO retains public TLS, host validation, WebSocket handling, and supervision. Operator watches configured YAML. Gateway is separate from Resource Manager and accepts only operator-owned policy.
+
+### Cluster
 
 ```mermaid
 flowchart LR
-    Browser[Browser] --> AIO[AIO proxy<br/>public TLS edge]
-    AIO -->|/idp| Dex[Dex]
-    AIO -->|/client/web, /client/web/plugins, /client/web/config| Gateway[Console Gateway process]
-    AIO -->|authenticated /api/*| RM[Resource Manager]
-    Gateway -->|global UI config and assets| Origins[Approved asset origins]
-    Gateway -. discovery/status .-> RM
+    Browser --> Route[OpenShift Route]
+    Route -->|/client/web/, /client/shell/*| Shell[Immutable shell Service]
+    Route -->|/client/web/plugins/*| Gateway[Console Gateway Service]
+    Route -->|/api/*| RM[Resource Manager Service]
+    Gateway --> Origins[Approved HTTPS origins]
 ```
 
-The AIO proxy currently routes Dex and Resource Manager directly. In the target sandbox topology, it continues to route authenticated `/api/*` requests to Resource Manager, routes `/idp` to Dex, and routes `/client/web/`, `/client/web/plugins/...`, and global `/client/web/config` to the console gateway. The console gateway owns global UI bootstrap and asset routing. It may obtain plugin discovery and status from Resource Manager, but Resource Manager does not select trusted origins.
+Operator, Gateway, and Resource Manager run with independent identities. Operator watches `PluginClientPolicy` resources and publishes read-only state. OpenShift Route owns public path routing; Gateway owns dynamic plugin origin enforcement.
 
-This keeps public TLS, Host validation, WebSocket handling, and s6 supervision in the existing AIO proxy while preserving an independent console-gateway process and configuration boundary. It also avoids placing the console gateway in front of unrelated Resource Manager APIs. Extending the AIO proxy to perform asset routing directly remains possible, but would combine public edge and asset-origin policy into one process.
+Connected deployments use approved external CDNs. Air-gapped deployments mirror artifacts to internal static hosts. Both preserve browser same-origin routing. A developer override may use a scoped `http://host.docker.internal:3001` origin only when explicit sandbox policy enables it.
 
-Browser traffic remains on the same public AIO origin:
+## Alternatives
 
-```mermaid
-flowchart LR
-    Browser[Browser] --> Edge[AIO edge / console gateway]
-    Edge -->|/client/web| Shell["Shell origin"]
-    Edge -->|/client/web/plugins/kind| Origin["Approved plugin origin"]
-    Edge -->|/client/web/config| Config["Global client configuration"]
-    Edge -->|/api/user/settings| UserConfig["User-specific configuration"]
-    Edge -->|authenticated /api/*| RM["Resource Manager"]
-```
+| Alternative | Decision | Reason |
+| --- | --- | --- |
+| Resource Manager serves all assets | Rejected | Resource Manager compromise controls browser code |
+| Browser directly loads third-party origins | Rejected | Bypasses route, integrity, credential, CSP, and audit policy |
+| Arbitrary Resource Manager proxy plugins | Rejected | Makes Resource Manager trusted Gateway code |
+| Asset distribution addon controlled by Resource Manager | Rejected | Recreates privileged asset authority with more lifecycle complexity |
 
-Resource definitions come from a local YAML file, environment variable, or CLI argument. The same route policy rules apply as in cluster mode; only the configuration loading and ingress mechanism differ.
-
-### Cluster deployment
-
-The console gateway runs as a separate Deployment and Service. Resource Manager and the gateway communicate over an internal authenticated channel or through the cluster API/configuration mechanism.
-
-The OpenShift Route terminates or forwards the public console hostname to the console gateway Service:
-
-```mermaid
-flowchart TB
-    Browser[Browser<br/>https://console.example.com] --> Route[OpenShift Route]
-    Route --> Gateway[Console Gateway Service]
-    Route -->|authenticated /api/*| RM["Resource Manager Service"]
-    Gateway -->|/client/web, /client/web/plugins, /client/web/config| Origins["Approved asset origins and global UI config"]
-```
-
-The OpenShift Route is the first network ingress hop. It provides public TLS, host/path matching, and routing to in-cluster Services. The console gateway is the first application routing hop for browser assets and global UI bootstrap, while Resource Manager remains a direct upstream for `/api`. Dynamic plugin routes and origin policy remain outside static OpenShift Route configuration. OpenShift Route should not be treated as the component that validates plugin origins or proxies directly to arbitrary CDN hosts.
-
-Plugin asset resources are loaded from the deployment namespace. A CRD is the preferred long-term representation if the cluster deployment owns the configuration lifecycle.
-
-### Connected deployment
-
-Plugin assets may be hosted on a company CDN or approved external CDN. The browser still uses the public gateway origin; the gateway fetches from the CDN.
-
-### Air-gapped or restricted-network deployment
-
-Assets are mirrored to an internal static host or gateway-accessible cache. The same plugin resource points to the internal origin. No browser connection to an external CDN is required.
-
-### Developer override
-
-A plugin resource may point one plugin to a local development server:
-
-```yaml
-name: gcphcp
-origin: http://host.docker.internal:3001
-routePrefix: /client/web/plugins/gcphcp
-```
-
-All other plugins continue using normal origins. This avoids rebuilding and redeploying the complete shell for every plugin change.
-
-## Configuration Loading
-
-The resource model should be shared across deployment modes.
-
-| Mode    | Resource input                                   |
-| ------- | ------------------------------------------------ |
-| Sandbox | YAML file, environment variable, or CLI argument |
-| Cluster | Namespace-scoped CRD or equivalent API resource  |
-| Tests   | In-memory resource list or fixture YAML          |
-
-Loading mechanism differs by environment; normalization and reconciliation do not. This avoids maintaining separate sandbox and cluster configuration models.
-
-## Trust Boundaries
-
-Target boundaries:
-
-```mermaid
-flowchart TB
-    Definitions[Resource definitions<br/>desired configuration authority] --> RM[Resource Manager<br/>catalog persistence, manifest validation, UI metadata]
-    RM -->|untrusted from asset-origin perspective after compromise| Gateway[Console Gateway<br/>asset delivery, route enforcement,<br/>trusted origin policy]
-    Gateway --> Origin[Asset origin / CDN<br/>trusted client bytes]
-    Gateway --> Browser[Browser<br/>executes shell and plugin code]
-```
-
-Separation fails if Resource Manager can freely redirect the browser to an untrusted origin. The design therefore requires:
-
-- Origin allowlists owned outside Resource Manager.
-- Route-prefix policy owned outside Resource Manager.
-- No credentials in URLs.
-- Gateway-side validation of every route update.
-- Independent gateway deployment identity and authorization.
-- Independent approval or signature for new origins.
-- Audit logs for route-policy changes.
-- Fail-closed behavior when trusted policy cannot be loaded.
-
-Signed route metadata is the preferred mechanism when Resource Manager is in the threat model. A deployment-owned allowlist can be sufficient only when plugin origins are fixed by deployment configuration and Resource Manager can change activation state but not origin mapping. Plain unsigned route settings written by Resource Manager are not sufficient.
-
-## Caching and Upgrades
-
-Manifests and runtime configuration are mutable metadata and should use revalidation or no-cache behavior. JavaScript and CSS bundles must use content-hashed filenames before they receive immutable cache headers. This requirement applies to the shell as well as every plugin; version directories alone are not sufficient if a file can be replaced at the same URL.
-
-Recommended cache behavior:
-
-- `plugin-manifest.json`: revalidate or short-lived cache.
-- Runtime UI configuration: no-cache or explicit versioned response.
-- Content-hashed shell and plugin JavaScript/CSS: long-lived immutable cache.
-- Gateway last-known-good route state: persistent and recoverable.
-
-The build pipeline must verify that emitted shell and plugin JavaScript/CSS filenames contain content hashes and that referenced files use those hashed names. The deployment must not apply immutable caching to an un-hashed bundle. Existing shell output should be checked explicitly; plugin hashing must not be assumed to imply shell hashing.
-
-Plugin upgrade sequence:
-
-1. Publish new version to asset origin.
-2. Validate new manifest through the reconciler.
-3. Persist validated metadata.
-4. Publish new route/catalog state to gateway.
-5. Retain old asset version for rollback and cache safety.
-
-Rollback changes the gateway policy resource to a previously validated version. It does not require rebuilding Resource Manager.
-
-## CLI and Native Clients
-
-The plugin resource should keep identity, version, dependency, and provenance fields usable by future CLI or native clients. This document does not define their binary distribution mechanism.
-
-Web-specific fields such as manifest URL, asset origin, and route prefix belong to a UI capability within the broader resource model. Future native clients may use the same plugin identity and catalog while selecting different artifacts.
-
-## Alternatives Considered
-
-### Resource Manager serves all assets
-
-Rejected for target architecture. It preserves the current implementation but does not separate client-code trust from Resource Manager.
-
-### Browser loads third-party CDN URLs directly
-
-Rejected as default. It creates origin, CSP, network-policy, and auditing problems. It can remain an explicitly controlled deployment option only if security policy permits it.
-
-### Gateway with arbitrary Resource Manager proxy plugins
-
-Rejected. It makes Resource Manager part of the gateway's trusted code and creates uncontrolled extension risk.
-
-### Push bundles into Resource Manager
-
-Rejected. Resource Manager should store metadata and validated manifests, not client bundle bytes. Asset publication and rollback belong to the asset host.
+An independently provisioned asset distribution component could replace Gateway only if Resource Manager cannot configure, replace, or activate it. That is equivalent to this design's independent Gateway boundary and is not proposed separately.
 
 ## Open Questions
 
-1. Must route/catalog updates be cryptographically signed for the OME-313 threat model, or are deployment allowlists sufficient?
-2. Should Console Gateway serve global `/client/web/config` while Resource Manager serves authenticated `/api/user/settings`, or should one component own both responses? See [Discussion Note: Asset Ownership](#discussion-note-asset-ownership) and [Discussion Note: Per-user Configuration and RBAC](#discussion-note-per-user-configuration-and-rbac).
-3. Is a generic `PluginRoutePolicy` resource the correct name and scope for gateway-owned plugin definitions?
-4. Should route updates use an authenticated API, a mounted file, or a gateway-native dynamic configuration protocol?
-5. Should OpenShift Route provide only public ingress and Service routing, with Console Gateway or an asset distribution addon handling dynamic asset-origin routing and policy?
-6. Should stale plugin status be exposed to administrators through the management UI and API, and which operational metrics or alerts are required? Active stale plugins remain visible to users.
-7. What availability policy applies to `required: true` plugins?
-8. Is direct CDN access ever allowed, or must all browser traffic always pass through the gateway?
-9. What manifest signature and artifact provenance format should be adopted?
-10. Should asset distribution be implemented by the Console Gateway, an independently deployed asset distribution addon, or a shared interface supporting both?
-11. Which implementation Jira issues should be created after design review?
-12. What internal authentication and protocol should protect the gateway-owned plugin discovery endpoint?
-13. Which component owns unauthenticated identity-provider bootstrap configuration in `/client/web/config`?
+1. Are deployment allowlists sufficient for OME-313, or are signed route/catalog updates required?
+2. Is `PluginClientPolicy` correct resource name and scope?
+3. Which operator policy source is preferred: mounted file, CRD, or administrator service?
+4. Which artifact provenance or manifest-signature format is required?
+5. What availability behavior applies to required client artifacts?
+6. Which metrics, alerts, and UI expose stale or never-valid plugins?
+7. Which authenticated protocol distributes catalog and integrity proof?
+8. Which deployment mechanism anchors immutable shell trust?
 
 ## Expected Implementation Outcomes
 
-Once this design is approved, implementation work is expected to split into independent outcomes:
-
-- Runtime plugin asset resource and configuration loading.
-- Persisted last-known-good plugin catalog.
-- Manifest fetch, validation, reconciliation, and retry.
-- Asset gateway routing and configuration publication.
-- Sandbox AIO gateway process integration.
-- Cluster gateway Deployment and Service.
-- Developer localhost asset override.
-- Security policy, origin allowlists, and optional signatures.
-- Content-hashed shell and plugin bundles, including build-time validation and cache-header enforcement.
-- UI configuration migration from build-time registry to runtime catalog.
-- Runtime global UI configuration snapshot generation and atomic publication.
-- Gateway-owned manifest discovery and sanitized internal plugin catalog.
-- Separation of global `/client/web/config` from authenticated `/api/user/settings`.
-- Unauthenticated web bootstrap and identity-provider configuration, with authenticated user settings and API access.
-- Observability and administrative status for stale, retrying, and never-valid plugins; active last-known-good plugins remain visible to users.
-
-## Discussion Note: Asset Ownership
-
-Open design question: should the Console Gateway own browser assets and global UI bootstrap, while Resource Manager remains responsible for user-specific UI configuration and authorization?
-
-The strongest practical separation is for the Console Gateway to own the global browser asset surface and `/client/web/config`. Resource Manager would expose platform APIs, plugin discovery/status, and authenticated user-specific configuration; it would not serve assets, select arbitrary asset origins, or be required to understand frontend bundle layout. The gateway would obtain approved global plugin state, enforce origin policy, serve or proxy assets, and produce global browser bootstrap configuration.
-
-An alternative keeps global UI metadata generation in Resource Manager while the Console Gateway validates and rewrites the result. This preserves more of the current implementation but leaves Resource Manager coupled to frontend configuration and increases the amount of gateway filtering required after a compromise. It does not remove the need for Resource Manager to provide user-specific configuration when RBAC or multitenancy changes what a user can see.
-
-Decision needed: do we want Resource Manager to be completely abstracted from frontend asset delivery while retaining ownership of user-specific authorization data, or do we intentionally retain Resource Manager as the global plugin metadata service behind the gateway?
-
-## Discussion Note: Per-user Configuration and RBAC
-
-Global plugin availability and user-specific plugin visibility are different concerns. The Console Gateway can serve the same global `/client/web/config` to every user because it contains only approved origins, manifests, and globally enabled plugin metadata. Resource Manager should serve `/api/user/settings` after authenticating the user and evaluating workspace, tenant, and role permissions.
-
-User-specific configuration should contain logical plugin identifiers, navigation layout, navigation order, and other presentation choices. It should not contain arbitrary asset origins or gateway route definitions. The browser uses the logical identifiers to select from globally approved plugin configuration.
-
-This avoids pushing a per-user route table from Resource Manager into the Console Gateway. It also preserves the correct security boundary: Resource Manager decides whether a user may access data and operations, while the Console Gateway decides whether an asset origin is trusted. Hiding an unauthorized navigation entry improves the user experience, but every Resource Manager API must independently enforce authorization. A user who can load a plugin bundle but lacks permission for its data must receive an authorization error from the API, not protected data.
-
-If a future requirement makes asset origins themselves tenant-specific, the gateway must receive logical tenant-scoped route selection rather than arbitrary URLs. It must resolve that selection against independently trusted policy before serving assets.
-
-## Explored Alternative: Asset Distribution Addon
-
-Another option considered was an independently deployed asset distribution addon. The addon would own plugin manifests, asset retrieval, caching, origin policy, and browser UI bootstrap. It could serve the shell and plugin assets without making Resource Manager the asset server.
-
-This could remove the need for a dedicated asset-routing implementation, but it does not automatically remove the need for an edge or ingress component. If the browser must continue using one public origin, OpenShift Route or the AIO proxy still needs to route public requests to the asset distribution addon and Resource Manager. In that model, the addon replaces the Console Gateway's asset-serving function, while the existing edge retains public routing.
-
-The addon could also be exposed directly on a separate browser origin, but that introduces CORS, CSP, cookie, network-policy, and auditing concerns. It is not the preferred default.
-
-This alternative is rejected for the current design. If Resource Manager can register, configure, replace, or activate the asset distribution addon, a compromised Resource Manager could make a fake addon appear trusted and use it to serve compromised assets. Preventing that would require another independently trusted addon lifecycle, deployment authority, and policy channel. That effectively creates a new privileged addon type and recreates the Console Gateway boundary with more moving parts, so treating asset distribution as an infrastructure gateway is simpler and clearer.
-
-An asset distribution addon would only be viable if it were independently provisioned and trusted, and Resource Manager could not modify its code, origin policy, or activation authority. That is outside the scope of this design. The recommended model remains an independently deployed Console Gateway with deployment-owned or signed route policy.
+- Client Asset Operator policy loading, YAML/CRD watch, manifest validation, integrity catalog, and reconciliation status.
+- Persistent sanitized catalog and authenticated `/api/user/settings` generation.
+- Immutable shell origin, global `/client/web/config`, and Module Federation SRI runtime support.
+- Console Gateway route enforcement, safe upstream fetch, byte validation, cache policy, and audit logging.
+- AIO routing/process integration and cluster Deployment, Service, and Route resources.
+- Content-hash build validation, atomic configuration publication, developer override, and observability.
