@@ -221,16 +221,72 @@ Audience rules should be aligned with OME's planned authentication changes befor
 
 ### Signing enrollment
 
-Signing enrollment should use an OIDC authentication flow that returns an ID token, rather than relying on an API bearer token or token exchange. A separate client and purpose-specific audience are recommended when the customer IdP can support them, but should not be a universal integration requirement.
+Signing enrollment should use a separate OIDC authentication transaction that returns an ID token, rather than relying on an API bearer token or token exchange. A separate client and purpose-specific audience are recommended when the customer IdP can support them, but should not be a universal integration requirement.
 
 ```text
 normal API token          -> access token for OME API
-signing enrollment token  -> OIDC ID token with nonce-bound key evidence
+signing enrollment token  -> OIDC ID token with key evidence bound to enrollment transaction
 ```
 
-The signing client creates a key pair and places a self-signed proof-of-possession, or a binding to that proof, in the OIDC nonce. The user completes the IdP authentication flow, and the resulting ID token proves both the authenticated user and the key binding. The client sends the ID token and key-binding evidence to the resource manager for verification.
+The signing client creates a key pair and starts a one-time enrollment transaction with OME. OME associates the transaction with the public key and returns an enrollment ID and challenge. The client signs the challenge, then authenticates through the customer IdP. The existing OIDC library owns the protocol nonce and validates that the returned ID token belongs to that login attempt; the signing proof is bound to the OME enrollment transaction, not placed directly in the OIDC nonce.
 
-The verifier must validate the ID token as an OIDC authentication result, including its nonce, issuer, signature, subject, and intended client. It must not accept an arbitrary access token as signing enrollment evidence. Token keys continue to come from OIDC discovery and JWKS.
+An OIDC `nonce` is a random value generated for one login request. The client sends it to the IdP, the IdP copies it into the ID token, and the OIDC library verifies that it matches. Token signatures and TLS protect token integrity and transport; the nonce prevents a valid ID token from another login attempt being replayed or injected into this flow.
+
+The client should try silent OIDC authentication first. If the browser has no active IdP session, the client can fall back to interactive authentication. Silent authentication avoids asking users to enter their password during signing while still requiring an existing IdP session.
+
+Illustrative TypeScript using the existing `oidc-client-ts` dependency; this is not production code:
+
+```ts
+async function enrollSigningKey() {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const publicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+
+  const transaction = await fetch("/api/signing/enrollments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ publicKey }),
+  }).then((response) => response.json());
+
+  const proof = await signChallenge(keyPair.privateKey, transaction.challenge);
+  const manager = createSigningUserManager(transaction); // UserManager from oidc-client-ts
+
+  let user;
+  try {
+    user = await manager.signinSilent({
+      state: { enrollmentId: transaction.id },
+      extraQueryParams: { prompt: "none" },
+    });
+  } catch (error) {
+    if (!isLoginRequired(error)) throw error;
+    await manager.signinRedirect({
+      state: { enrollmentId: transaction.id },
+      extraQueryParams: { prompt: "login" },
+    });
+    return; // The callback completes the transaction after redirect.
+  }
+
+  await completeEnrollment(user, transaction, publicKey, proof);
+}
+
+async function completeEnrollment(user, transaction, publicKey, proof) {
+  await fetch("/api/signing/enrollments/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      enrollmentId: transaction.id,
+      idToken: user.id_token,
+      publicKey,
+      proof,
+    }),
+  });
+}
+```
+
+The verifier must validate the ID token as an OIDC authentication result, including its issuer, signature, subject, audience/client, and nonce. It must also validate the one-time enrollment transaction, challenge signature, and public key. It must not accept an arbitrary access token as signing enrollment evidence. Token keys continue to come from OIDC discovery and JWKS.
 
 The resulting evidence binds:
 
@@ -238,7 +294,7 @@ The resulting evidence binds:
 user identity
   -> authenticated by customer IdP
   -> proof of possession of signing key
-  -> nonce binds key evidence to OIDC authentication
+  -> enrollment transaction binds key evidence to OIDC authentication
 ```
 
 OME must remain a courier for the resulting evidence and must not mint or assert the signing identity. Signing-specific RBAC, provenance, and operation authorization still apply.
