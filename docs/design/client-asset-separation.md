@@ -142,15 +142,17 @@ The public boundary is intentional: `/client/web/`, `/client/web/plugins/...`, a
 
 The internal gateway discovery endpoint is different from public browser configuration. It must not be exposed anonymously; it requires service-to-service authentication and authorization between the console gateway and Resource Manager. Public assets being unauthenticated does not make plugin data unauthenticated. Plugin APIs must continue enforcing user, tenant, workspace, and role authorization independently.
 
-## Gateway Plugin Policy Resource
+## Client Plugin Policy Resource
 
-The deployment should define one policy resource for every browser plugin. This resource is loaded by Console Gateway, not Resource Manager. It can be represented as YAML in sandbox mode and as a CRD, ConfigMap, Secret, or equivalent deployment-owned configuration in cluster mode. It contains the authoritative asset origin, manifest location, route prefix, and enablement policy.
+The deployment should define one policy resource for every plugin identity, with one or more client-specific artifacts. Each artifact declares its client type, because web and CLI plugins may be built and published separately with different manifests, entrypoints, and distribution mechanisms. The web artifact is loaded by Console Gateway, not Resource Manager. CLI and future client artifacts are consumed by their corresponding client catalog or distribution service.
+
+The policy can be represented as YAML in sandbox mode and as a CRD, ConfigMap, Secret, or equivalent deployment-owned configuration in cluster mode. It contains authoritative distribution metadata for each client type, while keeping the plugin identity shared across clients.
 
 Conceptual shape:
 
 ```yaml
 apiVersion: ui.fleetshift.io/v1alpha1
-kind: PluginRoutePolicy
+kind: PluginClientPolicy
 metadata:
   name: gcphcp
 spec:
@@ -158,10 +160,16 @@ spec:
     name: gcphcp-plugin
     key: gcphcp
     version: 1.2.0
-  origin: https://assets.example.com/gcphcp/1.2.0
-  manifestPath: plugin-manifest.json
-  routePrefix: /client/web/plugins/gcphcp
-  enabled: true
+  clients:
+    web:
+      origin: https://assets.example.com/gcphcp/1.2.0/web
+      manifestPath: plugin-manifest.json
+      routePrefix: /client/web/plugins/gcphcp
+      enabled: true
+    cli:
+      artifact: oci://registry.example.com/gcphcp-cli:1.2.0
+      manifestPath: cli-manifest.json
+      enabled: true
   required: false
 ```
 
@@ -169,14 +177,14 @@ The final API shape remains open. At minimum, the resource must identify:
 
 - Stable plugin key and name.
 - Plugin version.
-- Manifest location.
-- Asset origin.
-- Public route prefix.
+- One or more client types, such as `web` or `cli`.
+- Client-specific manifest or artifact location.
+- Web asset origin and public route prefix, when `clientType` is `web`.
 - Required versus optional behavior.
 - Optional dependencies and compatibility constraints.
 - Optional signature or provenance information.
 
-Console Gateway validates the origin, manifest path, asset path, and public route before publishing the plugin. Resource Manager receives only the resulting sanitized catalog and must not be the authority that adds or changes an origin in the trusted set.
+Console Gateway validates web origins, manifest paths, asset paths, and public routes before publishing web plugins. Client-specific consumers validate their own artifact and manifest rules. Resource Manager receives only the resulting sanitized logical catalog and must not be the authority that adds or changes a web origin in the trusted set.
 
 ## Catalog Persistence
 
@@ -187,7 +195,8 @@ The gateway policy is authoritative for whether a plugin is available globally. 
 Conceptual catalog fields:
 
 - Plugin identity and version.
-- Gateway policy key or opaque route reference.
+- Available client types and per-client availability.
+- Per-client policy key or opaque artifact reference.
 - Validated manifest contents.
 - Last successful validation time.
 - Last attempted validation time.
@@ -203,7 +212,7 @@ Discovery is a reconciler, not a blocking one-shot startup operation.
 
 ### Startup
 
-1. Console Gateway loads deployment-owned `PluginRoutePolicy` resources.
+1. Console Gateway loads deployment-owned `PluginClientPolicy` resources.
 2. Console Gateway loads its last-known-good manifest and route state.
 3. Console Gateway fetches and validates manifests from approved origins.
 4. Console Gateway publishes global `/client/web/config` from validated state.
@@ -268,6 +277,7 @@ The internal discovery endpoint should be private to the deployment and authenti
 
 - Stable plugin key and name.
 - Version and availability state.
+- Available client types, such as `web` and `cli`.
 - Declared capabilities and dependencies.
 - Validated manifest extension types and logical module identifiers.
 - Policy key or opaque gateway-owned reference.
@@ -280,6 +290,8 @@ It should not return:
 - Browser-facing URLs that bypass gateway validation.
 
 Resource Manager can use this catalog to calculate `/api/user/settings`. The gateway remains responsible for fetching manifests, resolving origins, generating or finalizing `/client/web/config`, and serving browser assets.
+
+Client configuration generation is type-specific. The web catalog and Scalprum configuration are generated from `web` artifacts only. A future CLI catalog can consume `cli` artifacts and publish `/client/cli/config` without sending CLI manifests or artifacts through the Console Gateway's web asset routes.
 
 ## Gateway Manifest Validation
 
@@ -618,7 +630,7 @@ Rejected. Resource Manager should store metadata and validated manifests, not cl
 
 1. Must route/catalog updates be cryptographically signed for the OME-313 threat model, or are deployment allowlists sufficient?
 2. Should Console Gateway serve global `/client/web/config` while Resource Manager serves authenticated `/api/user/settings`, or should one component own both responses? See [Discussion Note: Asset Ownership](#discussion-note-asset-ownership) and [Discussion Note: Per-user Configuration and RBAC](#discussion-note-per-user-configuration-and-rbac).
-3. Is a generic `PluginRoutePolicy` resource the correct name and scope for gateway-owned plugin definitions?
+3. Is a generic `PluginClientPolicy` resource the correct name and scope for gateway-owned plugin definitions?
 4. Should route updates use an authenticated API, a mounted file, or a gateway-native dynamic configuration protocol?
 5. Should OpenShift Route provide only public ingress and Service routing, with Console Gateway or an asset distribution addon handling dynamic asset-origin routing and policy?
 6. Should stale plugin status be exposed to administrators through the management UI and API, and which operational metrics or alerts are required? Active stale plugins remain visible to users.
@@ -646,6 +658,7 @@ Once this design is approved, implementation work is expected to split into inde
 - UI configuration migration from build-time registry to runtime catalog.
 - Runtime global UI configuration snapshot generation and atomic publication.
 - Gateway-owned manifest discovery and sanitized internal plugin catalog.
+- Client-type-aware plugin policy and separate web/CLI artifact catalogs.
 - Separation of global `/client/web/config` from authenticated `/api/user/settings`.
 - Unauthenticated web bootstrap and identity-provider configuration, with authenticated user settings and API access.
 - Observability and administrative status for stale, retrying, and never-valid plugins; active last-known-good plugins remain visible to users.
