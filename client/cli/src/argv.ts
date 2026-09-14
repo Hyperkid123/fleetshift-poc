@@ -48,14 +48,23 @@ export function parseArgs(argv: string[]): ParsedArgs {
 export function flagString(
   args: ParsedArgs,
   name: string,
-  fallback = "",
-): string {
+  fallback: string | undefined = undefined,
+): string | undefined {
   const value = args.flags.get(name);
   return typeof value === "string" ? value : fallback;
 }
 
+export function flagNumber(
+  args: ParsedArgs,
+  name: string,
+  fallback: number | undefined = undefined,
+): number | undefined {
+  const value = args.flags.get(name);
+  return typeof value === "number" ? value : fallback;
+}
+
 export function outputFormat(args: ParsedArgs): OutputFormat {
-  return flagString(args, "output", "table").toLowerCase() === "json"
+  return flagString(args, "output", "table")?.toLowerCase() === "json"
     ? "json"
     : "table";
 }

@@ -1,11 +1,55 @@
+import { readFileSync } from "node:fs";
+
+import { client } from "@fleetshift/common/dynamic/client/generated/client.gen";
+import { Agent } from "undici";
+
 import { flagString } from "../argv";
 import { oidcRequest, type TokenResponse } from "../auth/helpers";
-import { type CliClient, createCliClient } from "../client";
 import { loadAuthConfig, loadStoredTokens, saveStoredTokens } from "../config";
+
+export async function unwrap<T>(
+  result: Promise<{ data?: T; error?: unknown }>,
+): Promise<T> {
+  const response = await result;
+  if (response.error) throw response.error;
+  if (response.data === undefined) throw new Error("No data returned from API");
+  return response.data;
+}
+
+function configureCliClient(
+  server: string,
+  token?: string,
+  caFile?: string,
+): typeof client {
+  const baseUrl = server.includes("://") ? server : `https://${server}`;
+  const dispatcher = caFile
+    ? new Agent({ connect: { ca: readFileSync(caFile) } })
+    : undefined;
+  client.setConfig({
+    baseUrl,
+    responseStyle: "fields",
+    throwOnError: false,
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers);
+      headers.set("Accept", "application/json");
+      if (init?.body && !headers.has("Content-Type")) {
+        headers.set("Content-Type", "application/json");
+      }
+      if (token) headers.set("Authorization", `Bearer ${token}`);
+      return fetch(input, {
+        ...init,
+        headers,
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
+    },
+  });
+  return client;
+}
 
 export async function clientForArgs(
   args: Parameters<typeof flagString>[0],
-): Promise<CliClient> {
+  accessToken?: string,
+): Promise<ReturnType<typeof configureCliClient>> {
   const configDirectory = flagString(args, "config-dir") || undefined;
   const authConfig = await loadAuthConfig(configDirectory).catch(
     () => undefined,
@@ -41,17 +85,20 @@ export async function clientForArgs(
     tokens = await loadStoredTokens(configDirectory);
   }
   const server = serverForArgs(args);
-  return createCliClient(
+  return configureCliClient(
     server,
-    tokens?.access_token,
+    accessToken ?? tokens?.access_token,
     authConfig?.oidc_ca_file ?? process.env.FLEETSHIFT_CA_FILE,
   );
 }
 
 export function serverForArgs(args: Parameters<typeof flagString>[0]): string {
-  return flagString(
-    args,
-    "server",
-    process.env.FLEETCTL_SERVER || "https://fleetshift-sandbox.localhost:8085",
+  return (
+    flagString(
+      args,
+      "server",
+      process.env.FLEETCTL_SERVER ||
+        "https://fleetshift-sandbox.localhost:8085",
+    ) ?? "https://fleetshift-sandbox.localhost:8085"
   );
 }
