@@ -45,7 +45,7 @@
         "command": "npx vitest run --config vitest.config.ts"
       },
       "inputs": ["{projectRoot}/src/**/*", "{workspaceRoot}/vitest.config.ts"],
-      "dependsOn": ["generate-api"]
+      "dependsOn": ["build"]
     }
   }
 }
