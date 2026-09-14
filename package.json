@@ -2,6 +2,7 @@
   "name": "fleetshift-poc",
   "private": true,
   "workspaces": [
+    "client/cli",
     "client/web",
     "sdk/common",
     "sdk/build-utils",
@@ -10,7 +11,7 @@
     "extensions/kind/client"
   ],
   "devDependencies": {
-    "@module-federation/enhanced": "2.8.1",
+    "@module-federation/enhanced": "^2.9.0",
     "@nx/devkit": "23.1.1",
     "@nx/docker": "^23.1.1",
     "@nx/eslint": "^23.1.1",
@@ -41,6 +42,7 @@
     "nx": "nx"
   },
   "dependencies": {
+    "ink": "^6.0.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   }
