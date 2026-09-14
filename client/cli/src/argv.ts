@@ -60,7 +60,10 @@ export function flagNumber(
   fallback: number | undefined = undefined,
 ): number | undefined {
   const value = args.flags.get(name);
-  return typeof value === "number" ? value : fallback;
+  if (typeof value === "number") return value;
+  if (typeof value !== "string" || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 export function outputFormat(args: ParsedArgs): OutputFormat {

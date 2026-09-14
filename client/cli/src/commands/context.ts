@@ -8,12 +8,27 @@ import { oidcRequest, type TokenResponse } from "../auth/helpers";
 import { loadAuthConfig, loadStoredTokens, saveStoredTokens } from "../config";
 
 export async function unwrap<T>(
-  result: Promise<{ data?: T; error?: unknown }>,
+  result: Promise<{
+    data?: T;
+    error?: unknown;
+    response?: Response;
+  }>,
 ): Promise<T> {
-  const response = await result;
-  if (response.error) throw response.error;
-  if (response.data === undefined) throw new Error("No data returned from API");
-  return response.data;
+  const resultValue = await result;
+  if (resultValue.error) {
+    const error = resultValue.error;
+    const message =
+      typeof error === "object" && error !== null && "message" in error
+        ? String(error.message)
+        : String(error);
+    const status = resultValue.response?.status;
+    throw new Error(`${status ? `${status} ` : ""}${message}`, {
+      cause: error,
+    });
+  }
+  if (resultValue.data === undefined)
+    throw new Error("No data returned from API");
+  return resultValue.data;
 }
 
 function configureCliClient(
