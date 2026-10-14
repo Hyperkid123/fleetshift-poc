@@ -70,11 +70,15 @@ mTLS certificate provisioning remains open as a separate transport concern.
 
 ## Orchestration and rollout
 
-### Deployment defaults for registered capabilities
+### Addon enablement and initial fulfillment
 
-**Question:** When an addon registers a capability but no deployment exists yet, should the platform auto-create a default deployment (and thus a fulfillment) or stay fully explicit?
+**Question:** Should enabling an addon only make its capabilities available, with fulfillment intent established separately, or should enablement also be able to establish an initial fulfillment that uses those capabilities on selected targets?
 
-**Context:** Some existing systems, such as OCM's `global` Placement, default to deploying everywhere. The explicit-opt-in model, where no deployment means nothing happens, is cleaner long term. This is primarily a UX decision rather than an architectural one.
+**Context:** In the resource manager design, [enabling and connecting an addon](addon_integration.md#addon-lifecycle) makes its capabilities available; a fulfillment uses them to deliver workloads to targets. The question concerns when fulfillment intent is established, leaving open which user-facing resource or workflow creates and owns the fulfillment. OCM also distinguishes hub registration (`ClusterManagementAddOn`) from per-cluster enablement (`ManagedClusterAddOn`), with an [install strategy](https://open-cluster-management.io/docs/getting-started/installation/addon-management/#install-strategy) able to automate per-cluster enablement using Placement decisions.
+
+MCOA combines these choices in its enablement flow: when MCOA is enabled through the `MultiClusterObservability` resource, the MCO operator creates a `ClusterManagementAddOn` whose [initial install strategy](https://github.com/stolostron/multicluster-observability-operator/blob/main/operators/multiclusterobservability/manifests/base/multicluster-observability-addon/cluster_management_addon.yaml#L43-L48) references the `global` Placement in `open-cluster-management-global-set`. The addon manager enables MCOA on the selected clusters. This is MCOA's supplied installation policy; the Placement itself only selects clusters. See the [MCOA migration flow](../mcoa_migration.md#before-current-mcoa-path).
+
+**Leaning:** Keep fulfillment intent distinct from capability registration. An enablement flow could establish both explicitly, with a defined target scope, ownership, and lifecycle for the fulfillment. How that fulfillment is created and owned remains open; registration alone should not imply delivery to targets.
 
 ### Invalidation granularity
 

@@ -46,14 +46,14 @@ The four-CR indirection (Policy, ConfigurationPolicy, Placement, PlacementBindin
 The MCOA path uses the addon-framework, which is itself an inverted model (the framework calls the addon for manifests). But the indirection is through multiple CRs:
 
 ```
-MCO operator reconciles MCO CR
-  -> renders ClusterManagementAddOn CR (with installStrategy: Placements, ref: global)
+MCO operator reconciles MCO CR with MCOA enabled
+  -> creates ClusterManagementAddOn CR initially (installStrategy: Placements, ref: global)
   -> renders AddOnDeploymentConfig CR (with CustomizedVariables from MCO CR capabilities)
   -> renders multicluster-observability-addon-manager Deployment
   -> applies all to the platform deployment
 
 Addon-framework (running in addon-manager) watches CMA + Placement:
-  -> resolves Placement "global" -> all managed clusters
+  -> consumes decisions for the referenced Placement (initially "global") -> selected eligible clusters
   -> for each cluster:
        creates ManagedClusterAddOn CR
        calls addon agent's Manifests() -> renders spoke resources
@@ -61,11 +61,13 @@ Addon-framework (running in addon-manager) watches CMA + Placement:
 
 MCO CR config changes:
   -> MCO operator updates AddOnDeploymentConfig CustomizedVariables
-  -> addon-framework watches ADC -> re-renders for all clusters
+  -> addon-framework watches ADC -> re-renders for selected clusters
   -> updates ManifestWorks
 ```
 
 This involves: 3 platform-side CRs rendered by MCO + 1 external Deployment + per-cluster MCA + per-cluster ManifestWork, all coordinated through CR watches.
+
+MCOA's [initial install strategy](https://github.com/stolostron/multicluster-observability-operator/blob/main/operators/multiclusterobservability/manifests/base/multicluster-observability-addon/cluster_management_addon.yaml#L43-L48) supplies target installation intent as part of enablement. The MCO operator [leaves the existing ClusterManagementAddOn for users to manage](https://github.com/stolostron/multicluster-observability-operator/blob/main/operators/multiclusterobservability/pkg/rendering/renderer_mcoa.go#L361-L367), so subsequent installation scope can differ. This is an integration policy, not an OCM-wide default to deploy every registered addon. The resource manager's corresponding [open question](architecture/open_questions.md#addon-enablement-and-initial-fulfillment) is whether addon enablement should also establish an initial fulfillment, leaving its creation and ownership mechanism open.
 
 ### After (strategy-based: platform orchestrates, strategies are pluggable)
 
