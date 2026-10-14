@@ -1,0 +1,366 @@
+package protocol
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// ProvenanceType is a well-known, versioned identifier for verifier and
+// protocol semantics. Authenticated configuration selects installed
+// implementations; it never supplies executable code.
+type ProvenanceType string
+
+const (
+	// ProvenanceTypeDirectKeyV1 is the naive retained-public-key profile
+	// used by this POC. It is a well-known type, not an RM-assigned ID.
+	ProvenanceTypeDirectKeyV1 ProvenanceType = "direct-key/v1"
+)
+
+// MediaType is an opaque label for how to interpret content, including its
+// meaning and encoding. It selects the reader or payload handler for proof
+// encodings, replaceable support material, and delivered payload items.
+type MediaType string
+
+// Encoded is media-typed bytes. TypedEvidence, SupportMaterial, and
+// TypedManifest share this form and remain distinct types because their
+// authority and lifecycle differ. TypedAssertion is not Encoded: a
+// predicate type is purpose, not a media type.
+// Bytes are immutable once the value is shared within common code. Use Clone
+// when independent buffer ownership is needed at an API or storage boundary.
+type Encoded struct {
+	MediaType MediaType `json:"media_type"`
+	Bytes     []byte    `json:"bytes"`
+}
+
+// Clone returns a copy whose byte slice does not alias the original.
+func (e Encoded) Clone() Encoded {
+	return Encoded{
+		MediaType: e.MediaType,
+		Bytes:     cloneBytes(e.Bytes),
+	}
+}
+
+func cloneBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneSlice[T any](in []T) []T {
+	if in == nil {
+		return nil
+	}
+	out := make([]T, len(in))
+	copy(out, in)
+	return out
+}
+
+// PredicateType names the inner assertion's purpose. It is established only
+// after a selected profile authenticates the evidence bytes.
+type PredicateType string
+
+const (
+	// PredicateTypeDeploymentV1 is a user's deployment authorization: the
+	// signed content is the fulfillment recipe as typed manifests.
+	PredicateTypeDeploymentV1 PredicateType = "deployment/v1"
+
+	// PredicateTypeManagedResourceV1 is a user's managed-resource
+	// authorization: the signed content is a resource spec plus who owns
+	// it. Applying it requires a verified fulfillment-relation/v1.
+	PredicateTypeManagedResourceV1 PredicateType = "managed-resource/v1"
+
+	// PredicateTypeFulfillmentRelationV1 is supporting graph evidence that
+	// maps a managed-resource identity onto a payload MediaType. It is
+	// not a user-intent root predicate.
+	PredicateTypeFulfillmentRelationV1 PredicateType = "fulfillment-relation/v1"
+
+	// PredicateTypeTrustConfigUpdateV1 is an authenticated trust-configuration
+	// successor, as defined by the provenance design.
+	PredicateTypeTrustConfigUpdateV1 PredicateType = "trust-config-update/v1"
+)
+
+// TypedEvidence is the common stored object: a provenance type plus Encoded
+// proof bytes. Common storage, digesting, bounding, and routing operate on
+// this envelope and do not parse the inner format.
+type TypedEvidence struct {
+	ProvenanceType ProvenanceType `json:"provenance_type"`
+	Encoded
+}
+
+// Identity returns the domain-separated binding of provenance type, media
+// type, and exact bytes. Changing any field produces a different item.
+func (e TypedEvidence) Identity() (Digest, error) {
+	return DigestObject(purposeTypedEvidenceIdentity, e)
+}
+
+// TypedAssertion is the inner purpose-typed statement a profile authenticates.
+// Its bytes are immutable when shared within common code.
+// Envelope encodings such as a Sigstore Bundle carry this statement inside
+// TypedEvidence bytes. Finish emits it; common code does not read it from a
+// parallel couriered field.
+type TypedAssertion struct {
+	PredicateType PredicateType `json:"predicate_type"`
+	Bytes         []byte        `json:"bytes"`
+}
+
+// Digest returns the inner content digest consumed by AuthenticatedEvidence.
+// It is not the outer TypedEvidence identity.
+func (a TypedAssertion) Digest() (Digest, error) {
+	return DigestObject(purposeContentDigest, a)
+}
+
+// ConstraintOutcome is a named result defined by the matched authenticated
+// policy. It is not an unbounded facts map.
+type ConstraintOutcome struct {
+	Name   string `json:"name"`
+	Result string `json:"result"`
+}
+
+// AuthenticatedEvidence is the deliberately small common result of profile
+// verification. Configuration digests bind the result to the exact
+// authenticated policy and anchors used; they are not profile selectors.
+type AuthenticatedEvidence struct {
+	Principal             Principal           `json:"principal"`
+	PredicateType         PredicateType       `json:"predicate_type"`
+	ContentDigest         Digest              `json:"content_digest"`
+	ProvenanceType        ProvenanceType      `json:"provenance_type"`
+	AuthorityConfigDigest Digest              `json:"authority_config_digest"`
+	ProfileConfigDigest   Digest              `json:"profile_config_digest"`
+	SatisfiedConstraints  []ConstraintOutcome `json:"satisfied_constraints,omitempty"`
+}
+
+// TentativeHints are parsed from untrusted evidence to locate authenticated
+// authority configuration and a candidate delivery policy. They grant no
+// identity or authority. Assertion is the unverified inner statement recovered
+// by the native implementation. Its purpose locates policy; common predicate
+// code may decode lookup fields from its body. Only Finish supplies authenticated
+// content. Assertion bytes are immutable within common code and detached at
+// profile boundaries.
+type TentativeHints struct {
+	Scheme          IdentityScheme  `json:"scheme"`
+	Authority       Authority       `json:"authority"`
+	TenantPartition TenantPartition `json:"tenant_partition,omitempty"`
+	Subject         Subject         `json:"subject,omitempty"`
+	Assertion       TypedAssertion  `json:"assertion"`
+}
+
+// SupportMaterial is replaceable, reconstructable profile proof material
+// assembled by the resource manager. It uses the Encoded form; the profile
+// is implied by the evidence it accompanies. It is not part of the immutable
+// TypedEvidence identity and gains authority only by verifying against
+// retained state and committed evidence.
+// Replacing support creates a new value; shared support bytes remain immutable.
+type SupportMaterial Encoded
+
+// SignedStatement is one independently authenticated assertion as couriered
+// to a verifier. Evidence is the immutable proof encoding; the inner
+// statement lives in those bytes. Support is replaceable material used by
+// the selected profile to verify that evidence. It is not a second signed
+// assertion. A delivery package couriers each statement as an Item, which
+// may also carry that statement's evidence-log inclusion.
+// Common code shares the statement and its backing buffers as immutable values.
+type SignedStatement struct {
+	Evidence TypedEvidence   `json:"evidence"`
+	Support  SupportMaterial `json:"support"`
+}
+
+// DeliveryPackage is the couriered mutation a target verifies. Root and
+// supporting items are the same kind of object: a SignedStatement plus that
+// statement's optional evidence-log inclusion. The inner assertion is
+// extracted from each statement's evidence by the selected profile.
+// EvidenceLog is the shared checkpoint transition and consistency proof;
+// it does not authorize content. Per-item inclusion lives on Item.
+// Common code treats the package and all nested buffers as immutable. A target
+// takes its own snapshot at ingestion; assembling a package can borrow stored
+// immutable evidence.
+type DeliveryPackage struct {
+	Root        Item               `json:"root"`
+	Supporting  []Item             `json:"supporting,omitempty"`
+	EvidenceLog *EvidenceLogUpdate `json:"evidence_log,omitempty"`
+}
+
+// Item is one slot in a couriered delivery package: a SignedStatement plus
+// that statement's optional FleetShift evidence-log inclusion. It is a
+// package slot, not a provenance type. Embedding keeps the JSON object
+// flat (evidence, support, evidence_log) while keeping SignedStatement
+// distinct. SelectAndVerify takes Item so it can verify the sibling
+// inclusion; VerifyRequest and ApplyRequest continue to take
+// SignedStatement. The inclusion is common couriered material, not
+// SupportMaterial and not part of TypedEvidence identity.
+// An Item and its nested slices and pointers are immutable within common code.
+type Item struct {
+	SignedStatement
+	EvidenceLog *EvidenceLogInclusion `json:"evidence_log,omitempty"`
+}
+
+// DeliveryContext is the bounded context used to match a delivery policy
+// before evidence is authoritative. Common selection derives these fields from
+// untrusted evidence hints and rechecks them against authenticated content.
+// Callers supply no tenant expectation. Package position does not affect
+// provenance policy; common predicate handlers check tenant relationships and
+// determine whether the selected root can produce an action.
+type DeliveryContext struct {
+	PredicateType   PredicateType   `json:"predicate_type,omitempty"`
+	TenantPartition TenantPartition `json:"tenant_partition,omitempty"`
+}
+
+const (
+	ActionPut    = "put"
+	ActionRemove = "remove"
+)
+
+// DeliveryScope is signed delivery-protocol identity, not a predicate. It
+// is embedded in each root authorization so the resource manager cannot
+// retarget tenant, placement, resource, generation, or action.
+//
+// Tenant is the authority-scoped external identity, not an RM routing ID.
+// FullResourceName is the AIP-122 identity of the Deployment or
+// ManagedResource. TargetID is a stand-in for a placement strategy: this
+// POC uses one static target rather than a selector. A later placement
+// model replaces TargetID without changing the resource name, generation,
+// or action.
+type DeliveryScope struct {
+	Tenant           Tenant           `json:"tenant"`
+	TargetID         string           `json:"target_id"`
+	FullResourceName FullResourceName `json:"name"`
+	Generation       uint64           `json:"generation"`
+	Action           string           `json:"action"`
+}
+
+// TypedManifest is one delivered payload item. It is Encoded: a payload
+// interpretation label and the exact bytes to interpret.
+type TypedManifest Encoded
+
+// DeploymentAuthorization is the exact inner assertion for a deployment/v1
+// predicate. The signed content is the fulfillment recipe.
+type DeploymentAuthorization struct {
+	DeliveryScope
+	Manifests []TypedManifest `json:"manifests"`
+}
+
+// Assertion returns the purpose-typed inner content of a deployment
+// authorization.
+func (a DeploymentAuthorization) Assertion() (TypedAssertion, error) {
+	encoded, err := MarshalCanonical(a)
+	if err != nil {
+		return TypedAssertion{}, err
+	}
+	return TypedAssertion{
+		PredicateType: PredicateTypeDeploymentV1,
+		Bytes:         encoded,
+	}, nil
+}
+
+// ManagedResourceAuthorization is the exact inner assertion for a
+// managed-resource/v1 predicate. The signed content is a resource spec;
+// a verified fulfillment relation says how to fulfill it.
+type ManagedResourceAuthorization struct {
+	DeliveryScope
+	ResourceType ResourceType    `json:"resource_type"`
+	Spec         json.RawMessage `json:"spec"`
+}
+
+// Assertion returns the purpose-typed inner content of a managed-resource
+// authorization.
+func (a ManagedResourceAuthorization) Assertion() (TypedAssertion, error) {
+	encoded, err := MarshalCanonical(a)
+	if err != nil {
+		return TypedAssertion{}, err
+	}
+	return TypedAssertion{
+		PredicateType: PredicateTypeManagedResourceV1,
+		Bytes:         encoded,
+	}, nil
+}
+
+// FulfillmentRelation is the exact inner assertion for a
+// fulfillment-relation/v1 predicate. This POC implements only
+// RegisteredSelfTarget: the addon claims this resource type and fulfills
+// it as a payload of MediaType. The media type must denote the same resource-spec
+// interpretation as ResourceType, so apply can use the media type alone.
+type FulfillmentRelation struct {
+	ResourceType ResourceType `json:"resource_type"`
+	MediaType    MediaType    `json:"media_type"`
+}
+
+// Assertion returns the purpose-typed inner content of a fulfillment
+// relation.
+func (a FulfillmentRelation) Assertion() (TypedAssertion, error) {
+	encoded, err := MarshalCanonical(a)
+	if err != nil {
+		return TypedAssertion{}, err
+	}
+	return TypedAssertion{
+		PredicateType: PredicateTypeFulfillmentRelationV1,
+		Bytes:         encoded,
+	}, nil
+}
+
+func cloneSignedStatement(s SignedStatement) SignedStatement {
+	return SignedStatement{
+		Evidence: TypedEvidence{
+			ProvenanceType: s.Evidence.ProvenanceType,
+			Encoded:        s.Evidence.Encoded.Clone(),
+		},
+		Support: SupportMaterial(Encoded(s.Support).Clone()),
+	}
+}
+
+// DecodeDeliveryScope extracts signed delivery-protocol identity from a
+// root authorization body. Extra JSON fields are ignored so both
+// deployment and managed-resource bodies decode. The resource identity is
+// FullResourceName, not an RM-assigned fulfillment ID. Evidence encodings
+// are profile-owned; callers first obtain the statement with
+// ResourceManagerAPI.DecodeAssertion.
+func DecodeDeliveryScope(assertion TypedAssertion) (DeliveryScope, error) {
+	var scope DeliveryScope
+	if err := json.Unmarshal(assertion.Bytes, &scope); err != nil {
+		return DeliveryScope{}, fmt.Errorf("%w: decode delivery scope: %v", ErrMalformedEvidence, err)
+	}
+	return scope, nil
+}
+
+// DecodeDeploymentAuthorization decodes a deployment/v1 assertion body.
+func DecodeDeploymentAuthorization(assertion TypedAssertion) (DeploymentAuthorization, error) {
+	if assertion.PredicateType != PredicateTypeDeploymentV1 {
+		return DeploymentAuthorization{}, fmt.Errorf("%w: %s", ErrUnknownPredicateType, assertion.PredicateType)
+	}
+	var authorization DeploymentAuthorization
+	if err := json.Unmarshal(assertion.Bytes, &authorization); err != nil {
+		return DeploymentAuthorization{}, fmt.Errorf("%w: decode deployment authorization: %v", ErrMalformedEvidence, err)
+	}
+	return authorization, nil
+}
+
+// DecodeManagedResourceAuthorization decodes a managed-resource/v1 assertion body.
+func DecodeManagedResourceAuthorization(assertion TypedAssertion) (ManagedResourceAuthorization, error) {
+	if assertion.PredicateType != PredicateTypeManagedResourceV1 {
+		return ManagedResourceAuthorization{}, fmt.Errorf("%w: %s", ErrUnknownPredicateType, assertion.PredicateType)
+	}
+	var authorization ManagedResourceAuthorization
+	if err := json.Unmarshal(assertion.Bytes, &authorization); err != nil {
+		return ManagedResourceAuthorization{}, fmt.Errorf("%w: decode managed-resource authorization: %v", ErrMalformedEvidence, err)
+	}
+	if authorization.ResourceType == (ResourceType{}) {
+		return ManagedResourceAuthorization{}, fmt.Errorf("%w: resource type is required", ErrMalformedEvidence)
+	}
+	return authorization, nil
+}
+
+// DecodeFulfillmentRelation decodes a fulfillment-relation/v1 assertion body.
+func DecodeFulfillmentRelation(assertion TypedAssertion) (FulfillmentRelation, error) {
+	if assertion.PredicateType != PredicateTypeFulfillmentRelationV1 {
+		return FulfillmentRelation{}, fmt.Errorf("%w: %s", ErrUnknownPredicateType, assertion.PredicateType)
+	}
+	var relation FulfillmentRelation
+	if err := json.Unmarshal(assertion.Bytes, &relation); err != nil {
+		return FulfillmentRelation{}, fmt.Errorf("%w: decode fulfillment relation: %v", ErrMalformedEvidence, err)
+	}
+	if relation.ResourceType == (ResourceType{}) {
+		return FulfillmentRelation{}, fmt.Errorf("%w: resource type is required", ErrMalformedEvidence)
+	}
+	return relation, nil
+}

@@ -10,14 +10,14 @@ The trust machinery used to authenticate FleetShift delivery evidence:
 - the boundary between profile verification and common attestation semantics
 - typed outer evidence versus inner assertion typing
 - credential presentation and request signing where they intersect provenance
-- verifier-owned profile state and the common append-only delivery log
+- verifier-owned profile state and the common append-only evidence log
 - trust updates and historical verification
 - the initial TUF, Sigstore, and continuity/v3 profiles, including their
   per-item encodings
 
 ## When to read this
 
-Read this when implementing or reviewing how a client creates provenance, how
+Read this when implementing or reviewing how a producer creates provenance, how
 the resource manager assembles evidence, how a target selects a verifier, or
 how trust configuration changes without making the resource manager a trust
 root.
@@ -48,6 +48,7 @@ root.
 - [Archived JWT and raw-key provenance](../archive/jwt_and_raw_key_provenance.md)
 - [Hybrid attestation prototype](../../../poc/attestation/hybrid/README.md)
 - [Sigstore/TUF bundle prototype](../../../poc/attestation/sigstore_tuf_bundle/README.md)
+- [Provenance suite APIs prototype](../../../poc/provenance-suites/README.md)
 
 ## Overview
 
@@ -64,13 +65,14 @@ durable cryptographic evidence answering three questions:
 That durable evidence is **provenance**. A user may authenticate a deployment
 intent, an addon may authenticate generated manifests, a placement service may
 authenticate a target decision, and an administrator may authenticate a trust
-update. The resource manager stores and couriers these independently
-authenticated assertions so the target can verify them itself.
+update. These signing actors are **producers**. The resource manager stores
+and couriers these independently authenticated assertions so the target can
+verify them itself.
 
 There is no single best cryptographic mechanism for every authority or
 environment. Sigstore can bind an OIDC identity to a short-lived certificate
 and Bundle; continuity/v3 can bind a principal to an authenticated key history
-and delivery-log position; TUF can authenticate content published by a
+and evidence-log position; TUF can authenticate content published by a
 repository role. They differ in signing workflow, trust anchors, retained
 state, historical verification, availability, and compromise guarantees. The
 initial Sigstore and continuity/v3 profiles share Sigstore Bundle v0.3 as the
@@ -81,7 +83,7 @@ use its repository-target representation.
 A **provenance profile** is a configured implementation of a common contract
 across those mechanisms. The contract covers:
 
-- client or publisher creation of evidence for exact typed content;
+- producer creation of evidence for exact typed content;
 - RM storage and assembly of the evidence and profile-specific support
   material; and
 - target verification against authenticated profile configuration and retained
@@ -170,7 +172,7 @@ stateful policy not reproduced at the target.
 
 Only constraints deliberately retained in authenticated target trust state or
 signed attestation content are expected to survive resource-manager
-compromise. The controlled client, provenance implementation, delivery agent,
+compromise. The controlled producer, provenance implementation, delivery agent,
 bootstrap path, configured external authorities, and target enforcement path
 remain trusted for their stated roles. A direct target mutation path that
 bypasses the delivery agent is outside this guarantee.
@@ -218,7 +220,6 @@ Conceptually:
 ```text
 AuthorityConfig {
     principal_authority: (scheme, authority)
-    tenant_mapping
     credential_methods[]
     provenance_profiles[]
     delivery_policies[]
@@ -263,41 +264,56 @@ One authority config may serve one FleetShift tenant or many tenant
 partitions. A provider-operated multi-tenant IdP or CA therefore does not
 require every tenant to duplicate the same trust configuration.
 
-### Canonical principals and tenant mapping
+### Canonical principals and external tenants
 
-Successful verification yields a canonical principal:
+Successful verification yields canonical external identities:
 
 ```text
 Principal = (scheme, authority, tenant_partition?, subject)
+Tenant    = (scheme, authority, tenant_partition?)
 ```
 
-The optional external tenant partition is scoped to its own `(scheme,
-authority)`. A value such as `acme` from one issuer has no relationship to the
-same string from another issuer. Equal subject strings under different
-authorities or tenant partitions identify different principals.
+The optional tenant partition is scoped to its own `(scheme, authority)`.
+A value such as `acme` from one issuer has no relationship to the same string
+from another issuer. Equal subject strings under different authorities or
+tenant partitions identify different principals. An absent partition denotes
+the unpartitioned tenant under that authority.
 
-An authority config defines at most one applicable tenant-mapping rule for the
-verified credential or provenance form. Supported rule shapes include:
+The configured credential or provenance implementation derives the partition
+from verified material: for example, a JWT claim, an X.509 OID or SAN component,
+or authenticated continuity state. It need not be a FleetShift-specific claim.
+Evidence hints and RM labels do not establish tenant identity.
 
-- an authenticated JWT claim;
-- an authenticated X.509 OID or SAN component;
-- a tenant value proven through continuity/v3 authenticated state; or
-- a static FleetShift tenant for a single-tenant authority.
+Internal FleetShift tenant IDs remain local to the resource manager for storage,
+routing, and ordinary permission evaluation. The RM binds an external tenant
+identity to that local ID. Producer configuration, signed delivery scopes, and
+target provisioning use the external identity; a delivery agent does not need
+the RM's external-to-internal mapping.
 
-The rule runs on verified material, not on an RM-supplied label. It maps the
-external tenant partition to a FleetShift tenant ID. Zero mappings and
-ambiguous mappings fail closed. Any tenant claimed in the delivery or by the
-resource manager must exactly match the verified result.
+Supporting evidence can belong to a different tenant or authority from the
+resource intent. Every assertion authenticates under its own source policy;
+common semantic evaluation then checks the authenticated external tenant against
+the relationship it resolves. Authentication can be memoized by evidence
+identity under fixed trust, while relationship checks run on every use.
+Consumer policy does not replace provider policy. Successful provenance
+verification does not move the RM's tenant/workspace permission state into the
+target.
 
-Tenant mapping isolates principals sharing one authority. It does not move the
-resource manager's complete tenant/workspace authorization state into the
-target. The resource manager remains responsible for ordinary permission
-evaluation after authentication produces the same canonical principal.
+Each platform has one provider tenant and zero or more consumer tenants. They
+share the same identity and ordinary tenant machinery. The provider governs
+root platform trust and installed abstractions, including managed-resource types
+in the single shared API. An independently running agent needs authenticated
+platform trust and a reference identifying that provider tenant; the reference
+can be provisioned separately from authority/profile configuration. A shared
+issuer can serve both provider and consumers, so the external reference includes
+the applicable tenant partition. Fulfillment semantics check that provider
+relationship after source-policy authentication; finer-grained addon
+responsibility remains an additional authorization requirement.
 
 ### Well-known provenance types
 
 Every provenance profile selects a well-known, versioned provenance type.
-Implementations arrive through the client's, resource manager's, and
+Implementations arrive through the producer's, resource manager's, and
 verifier's trusted software supply chains. Authenticated configuration selects
 and constrains installed implementations; it never supplies executable code.
 An unknown provenance type fails closed.
@@ -330,36 +346,74 @@ TypedEvidence {
 Evidence identity domain-separately binds all three. Changing provenance type,
 media type, or bytes produces a different item. The provenance type remains an
 untrusted routing hint until authenticated policy selects a matching profile.
-The inner assertion's content or predicate type is established only after that
+The inner assertion's predicate type is established only after that
 profile authenticates the bytes; it is not a substitute for the outer types
 and does not select a verifier.
 
 If a format also carries an internal media type, as Sigstore Bundle does, the
 selected profile requires it to match the outer `media_type`.
 
-Profile configuration is an authenticated entry inside an `AuthorityConfig`.
-It is not named by an RM-maintained or client-visible profile ID. An
-implementation may derive local storage keys or configuration references for
-profile state, but package data cannot use such a key to grant authority or
-select code.
+Profile configurations are defined once in their principal authority's
+`AuthorityConfig`. Delivery policies refer to an ordered list of exact,
+domain-separated configuration digests within that authority. Each digest
+binds the complete configuration, including anchors and parameters. Unknown
+references, duplicate definitions, and duplicate references invalidate
+configuration rather than becoming failed profile attempts. Changing a
+configuration changes its digest and requires updating its policy references.
+
+Published evidence, authority configuration, temporal constraints, and
+verification results are immutable values, including any nested buffers and
+references. Common coordination and semantic evaluation share them under that
+contract. Ownership copies belong at external ingestion and profile
+boundaries. A verification cache reuses immutable results, and a configuration
+change publishes a new value rather than mutating one already in use.
+
+These authenticated references are not producer-visible profile selectors.
+Evidence cannot name arbitrary configurations or resurrect historical anchors.
+An implementation may derive local storage keys for profile state, but package
+data cannot use such a key to grant authority or select code.
 
 ## Delivery Policy And Profile Selection
 
-Each authority defines deterministic delivery policies. A policy matches
+Each authority defines an ordered list of delivery policies. A policy matches
 bounded delivery context such as:
 
 - verified tenant partition;
-- delivery content type;
-- root authorization versus supporting graph evidence; and
+- assertion predicate type; and
 - other explicitly defined scope constraints.
+
+The first matching policy owns verification. Tenant-specific exceptions belong
+before a match-all default; an earlier default shadows later exceptions for
+the same purpose. Overlapping matches are permitted, and policy order is part
+of authenticated authority configuration. Verification failure never advances
+to another policy. Configuration validation still checks every policy's
+structure and profile references, including entries shadowed by earlier ones.
+
+A package designates one root for common semantic evaluation. Each assertion
+is authenticated under the policy for its purpose and principal authority,
+whether it appears as that root or as a dependency. An original resource
+intent therefore uses the same policy when it becomes prior evidence in an
+update chain. The common verifier checks authenticated relationships and
+requires the selected root to have delivery action semantics or be an admitted
+control event. A fulfillment relation can authenticate successfully while
+being unsuitable as a standalone delivery root.
 
 A matched policy states:
 
 - whether live credential presentation is required or allowed;
 - whether provenance is required or allowed;
 - constraints on the principal, content, freshness, or configured mechanism;
-  and
-- an ordered `any-of` list of provenance profiles.
+- whether evidence-log inclusion is required; and
+- an ordered `any-of` list of authority-local profile configuration digests.
+
+The effective evidence-log requirement is the union of the selected delivery
+policy's requirement and the provenance mechanism's intrinsic requirement.
+A tenant can request audit inclusion for a profile that does not otherwise
+need ordering, but cannot disable a mechanism's ordering requirement. The RM
+uses this same decision when registering accepted evidence; the target
+enforces it for each semantically reached assertion. Supplied optional log
+material is still verified. A package with no logged items need not carry a
+checkpoint update; an unlogged root may accompany logged supporting evidence.
 
 Profile combination has only `any-of` semantics in this design. Thresholds,
 principal diversity, and requirements for several verification paths are not
@@ -375,15 +429,20 @@ this sequence for each graph assertion:
    tenant hint.
 2. Use the tentative `(scheme, authority)` only to locate the corresponding
    authenticated `AuthorityConfig`. Missing configuration fails.
-3. Use delivery context and tentative fields to locate a candidate delivery
-   policy. Policy matching must resolve unambiguously.
-4. Filter that policy's ordered profile list to the evidence's well-known
-   provenance type.
+3. Select the first policy matching assertion purpose and the tentative tenant
+   partition, in authenticated configuration order. A nil tenant predicate
+   matches all tenants; an empty exact partition matches the unpartitioned
+   tenant. Verification failure does not fall back to a later policy.
+4. Resolve every reference in that policy's ordered profile list within the
+   authority, then filter by the evidence's well-known provenance type.
 5. Try matching profiles in authenticated policy order. The first profile that
    fully verifies the evidence and its constraints is selected.
-6. Derive the canonical principal and verified tenant mapping from the
-   authenticated result, then re-evaluate the policy and every supplied hint.
-   Any mismatch fails.
+6. Derive the canonical principal and external tenant from the authenticated
+   result, reselect the policy using those values, and recheck supplied hints.
+   Both selections must identify the same policy entry; any mismatch fails.
+   An omitted tenant hint cannot bypass an earlier tenant-specific policy.
+   Callers supply no expected tenant to authentication;
+   common semantic evaluation subsequently checks tenant relationships.
 
 Trying the next configured profile after a failure is deliberate `any-of`
 policy, not evidence-controlled downgrade. The evidence and RM may narrow the
@@ -412,12 +471,15 @@ the larger delivery graph.
 
 That unit has two typing layers:
 
-- The outer evidence is `TypedEvidence`: a versioned provenance type, a media
-  type, and the exact immutable bytes. Common storage, digesting, bounding,
-  and routing operate on this envelope. They do not parse the inner format.
-- The inner assertion has a content or predicate type that names the
-  assertion's purpose. The selected profile authenticates those bytes; the
-  common evaluator then consumes that purpose-typed content.
+- The outer evidence is `TypedEvidence`: a versioned provenance type plus
+  encoded bytes (media type and the exact immutable payload). Common storage,
+  digesting, bounding, and routing operate on this envelope. They do not
+  parse the inner format. The same encoded form is used for replaceable
+  support material and for each delivered payload item; those remain distinct
+  types because their authority and lifecycle differ.
+- The inner assertion has a predicate type that names the assertion's
+  purpose. The selected profile authenticates those bytes; the common
+  evaluator then consumes that purpose-typed content.
 
 The two layers are not interchangeable. A media type does not imply an
 assertion purpose, and an assertion's predicate type does not select a
@@ -425,12 +487,14 @@ verifier.
 
 Examples include:
 
-- a user's delivery authorization;
+- a user's `deployment/v1` authorization (typed manifests);
+- a user's `managed-resource/v1` authorization (resource spec and resource
+  type);
+- a `fulfillment-relation/v1` as supporting evidence for a managed resource;
 - an addon's exact manifest set;
 - a placement decision;
-- a fulfillment relation;
 - a signed update or derivation; and
-- a trust-configuration update.
+- a `trust-config-update/v1`.
 
 Evidence encodings remain profile-owned. The common interface does not require
 Sigstore Bundle, DSSE, or any one media type. The initial Sigstore and
@@ -444,8 +508,7 @@ Successful profile verification produces a deliberately small common result:
 ```text
 AuthenticatedEvidence {
     principal
-    mapped_fleetshift_tenant?
-    content_type
+    predicate_type
     content_digest
     provenance_type
     authority_config_digest
@@ -456,7 +519,7 @@ AuthenticatedEvidence {
 
 The configuration digests bind the result to the exact authenticated policy
 and anchors used during verification; they are audit and state-precondition
-data, not profile selectors. `content_type` and `content_digest` are the inner
+data, not profile selectors. `predicate_type` and `content_digest` are the inner
 authenticated assertion. They are not the outer `TypedEvidence` media type or
 bytes digest. `satisfied_constraints` contains only outcomes defined by the
 matched authenticated policy. Profile-specific attributes may influence
@@ -475,10 +538,15 @@ replace their authorship, or create a signature that speaks for the aggregate.
 
 An aggregate evidence package is therefore not a new provenance authority.
 It is a collection assembled by the RM so the target can evaluate one delivery.
-The package and the attestation graph remain common and profile-neutral. They
-may contain independently authenticated items that use different provenance
-types and media formats. A Sigstore Bundle represents one such item, not the
-aggregate.
+Each independently authenticated item is couriered as an `Item`: a signed
+statement (immutable `TypedEvidence` plus replaceable support material used
+to verify that evidence) together with that statement's optional evidence-log
+inclusion. Root and supporting items are the same kind of object. Inclusion
+is common couriered material, not `SupportMaterial` and not part of
+`TypedEvidence` identity. The package and the attestation graph remain
+common and profile-neutral. They may contain independently authenticated
+items that use different provenance types and media formats. A Sigstore
+Bundle represents one such item, not the aggregate.
 
 No evidence author is assumed to have seen evidence created later by another
 author.
@@ -505,13 +573,13 @@ graph owns:
 
 Graph selectors, indexes, and outer references locate evidence but confer no
 authority. Every accepted relationship must appear in authenticated content or
-follow from a deterministic transformation checked by the common evaluator.
+follow from a deterministic transformation checked by the common verifier.
 Changing an index or reference cannot substitute a different principal,
 content item, target, fulfillment, or generation.
 
 The concrete put or removal action comes from the target delivery contract; it
 is not duplicated as a second authoritative graph output. Outer tenant,
-target, fulfillment, generation, and routing values are compared with signed
+target, resource name, generation, and routing values are compared with signed
 or locally authenticated facts and are never authoritative alone.
 
 Unused evidence cannot satisfy a graph requirement, endorsement, or
@@ -525,7 +593,7 @@ integrity-checked before untrusted input can cause unbounded work.
 An authenticated root intent may describe desired state rather than the final
 target payload. For example, a user can authenticate a deployment spec and its
 manifest and placement strategies before an addon renders manifests or a
-placement service selects targets. The common evaluator checks that every
+placement service selects targets. The common verifier checks that every
 derived output is permitted by the authenticated intent and supporting
 assertions.
 
@@ -613,12 +681,21 @@ authenticated and derived updates advance the same lineage; an old assertion
 cannot be replayed over a newer generation merely because its signature still
 verifies.
 
+Deletion leaves a replay risk when creation evidence remains valid and the
+verifier has no record rejecting it. Signed creation nonces, retained by the
+verifier after revocation, are one option for addressing this risk. The
+[target delivery contract](target_delivery_contract.md#replay-after-deletion)
+describes the conditions, proposed nonce approach, retention tradeoff, and
+storage estimates.
+
 Dynamic-scope assertions may intentionally omit one concrete generation when
 they authorize a standing or selector-based relationship. The applicable
-content type and constraints must define whether authorization is standing,
-once per target, or snapshot-scoped. The common delivery log supplies durable
+predicate type and constraints must define whether authorization is standing,
+once per target, or snapshot-scoped. The common evidence log supplies durable
 ordering and rollback resistance but does not silently turn a reusable
-assertion into single-use authorization.
+assertion into single-use authorization. Log positions are assigned when the
+resource manager accepts evidence, not when a delivery or outbox entry is
+created.
 
 The [hybrid prototype](../../../poc/attestation/hybrid/README.md) exercises
 these graph, derivation, placement, removal, and constraint semantics using an
@@ -628,15 +705,18 @@ A provenance profile neither replaces nor branches the common semantics.
 ### Shared-authority delivery example
 
 Consider a provider-operated OIDC issuer and Fulcio CA serving several managed
-service tenants. The authority config is keyed by the OIDC issuer and maps a
-verified `tenant` claim to a FleetShift tenant. Its root-delivery policy allows
-an ordered set of Sigstore profiles configured with the shared Fulcio CA.
+service tenants. The authority config is keyed by the OIDC issuer. Its
+Sigstore configurations specify how verified identity material establishes an
+external tenant partition. Deployment policies can match that partition and
+refer to shared Fulcio configurations by digest.
 
 Alice signs tenant A's delivery authorization through Sigstore. The RM claims
 that the request is for tenant A and attaches Alice's Bundle. That claim only
 locates the authority config. The target verifies the Fulcio chain and OIDC
 identity extensions, obtains Alice's canonical OIDC principal and tenant
-partition, maps that partition to tenant A, and rechecks the root policy.
+partition, rechecks the policy for that intent, and compares the external
+tenant identity with the signed scope and the target's provisioned tenant A.
+The target does not translate that identity to an internal FleetShift ID.
 
 The signed intent names a provider addon as its manifest strategy. That addon
 signs the exact manifests using its provider workload authority, such as a
@@ -687,7 +767,7 @@ without requiring IdP-issued proof-of-possession support.
 The signature covers the relevant request components, credential binding,
 freshness data, audience or destination, and body or intent digest as
 applicable. Verification reuses authority lookup, credential/key validation,
-canonical identity, tenant mapping, and policy constraints.
+canonical external identity, tenant partition, and policy constraints.
 
 A request signature authorizes only the live root request. It is not durable
 historical evidence and cannot authenticate supporting graph assertions. The
@@ -703,19 +783,18 @@ machinery is shared.
 
 ## Component Responsibilities
 
-### Client
+### Producer
 
-The client produces canonical typed assertions, presents live credentials, and
-uses the selected provenance implementation to create evidence. Common client
+The producer produces canonical typed assertions, presents live credentials, and
+uses the selected provenance implementation to create evidence. Common producer
 code identifies the allowed provenance type and principal authority; it does
 not obtain an RM-maintained profile or anchor ID.
 
 The profile-specific path owns its signing ceremony. Depending on the profile,
 that may include a device key, operating-system key handle, OIDC redirect,
 Fulcio issuance, repository publication, or collection of proof material. A
-client or addon receives purpose-specific signing operations over known
-content, not unrestricted access to private key bytes or a general signing
-oracle.
+producer receives purpose-specific signing operations over known content,
+not unrestricted access to private key bytes or a general signing oracle.
 
 ### Resource manager
 
@@ -729,10 +808,18 @@ The RM:
   objects;
 - records resource intent and history;
 - invokes profile-specific work needed by the mutation's durable transaction;
-- commits durable deliveries to the common delivery log;
+- registers accepted evidence in the common evidence log, assigning each
+  identity one canonical position independent of later deliveries or targets;
+- enqueues separate delivery and outbox work; a log index is not a retry
+  handle;
 - assembles the attestation graph and replaceable verification material for
   the target's retained state; and
 - routes the resulting package to the target.
+
+When the RM needs routing identity from a delivery (tenant, target, and the
+producer-defined resource name), it asks the selected profile to unwrap the
+inner statement from `TypedEvidence`. Common code then reads the common
+statement body. The RM does not parse profile-owned evidence encodings.
 
 RM verification is authoritative for whether the RM accepts an API request.
 It is not a substitute for target verification. The RM may repeat target-like
@@ -745,10 +832,12 @@ choose a profile outside authenticated target policy, or make unverified proof
 material satisfy target-retained constraints.
 
 Acceptance of an RM mutation must durably couple the resource change, original
-evidence, resource history, and required delivery-log or profile work. A
+evidence, resource history, and required evidence-log or profile work. A
 database transaction, transactional outbox, or equivalent durable workflow may
 provide that boundary. Profile-specific code participates in the operation but
 does not own or bypass the RM's transaction and authorization rules.
+Delivery and outbox records are a separate dispatch identity from the
+evidence-log position assigned at acceptance.
 
 ### Target
 
@@ -759,8 +848,9 @@ The target or delivery agent:
 - verifies credentials and provenance under matched delivery policy;
 - validates the attestation graph and target-local constraints;
 - applies authenticated content through profile-neutral delivery machinery;
-- retains profile and delivery-log state required by its accepted profiles; and
-- acknowledges only after it has durably guaranteed safe progress or retry.
+- retains profile and evidence-log state required by its accepted profiles; and
+- acknowledges only after successful evaluation and durable safe acceptance,
+  or recognition of previously evaluated and completed work.
 
 The boundary is conceptual rather than a required pair of protocol methods:
 
@@ -777,6 +867,23 @@ delivery handling
 
 Delivery handling does not reparse raw credentials, signatures, authority
 claims, or profile-specific proofs.
+
+Common evaluation is reusable independently of ordinary application storage,
+generation fencing, and effects. It authenticates the root and validates common
+scope before invoking an optional application-owned generation precheck. A
+cheap precheck is recommended to reject stale work or recognize completed work
+before evaluating support. It may retain a transient guard or version token;
+it does not admit a generation, authorize effects, or permit acknowledgement.
+Omitting it can make an invalid retry fail before discovering prior completion.
+
+The resulting action crosses into application-owned acceptance. The application
+must enforce the final generation fence and either complete effects or durably
+retain enough evaluated work and execution state to resume. It may then
+acknowledge before effects finish. Its execution machinery must fence against
+newer accepted generations, including those not yet applied. Accepted/in-progress
+work cannot use the completed-generation shortcut. Profile-owned lifecycle
+events follow their profile's apply and durability contract after evaluation.
+See [target_delivery_contract.md](target_delivery_contract.md#generation-ordering-and-stale-delivery-prevention).
 
 ## Authority And Profile Lifecycle Operations
 
@@ -798,10 +905,37 @@ Examples:
 Common FleetShift API conventions still apply: authenticate the caller,
 perform RM authorization, route through authenticated authority config, use
 idempotency keys where needed, and integrate with durable workflows and the
-delivery log where ordering has security meaning. The provenance type or
+evidence log where ordering has security meaning. The provenance type or
 credential method owns its operation schema, validation, and state transition.
 
-## Retained State And Delivery Ordering
+Those typed submit APIs still become ordinary accepted evidence. After the
+resource manager accepts the request, it registers the evidence identity in
+the evidence log—once, at first acceptance of that exact envelope—and
+enqueues courier work to the agents that must apply it. Enrollment is
+relevant to every agent that will later verify that principal; there is no
+fulfillment target. Rotation, revocation, and similar suite events follow the
+same path. Fan-out to many targets does not create many log positions.
+
+After log verification and profile selection, the authenticated predicate type
+selects apply:
+
+- user-intent predicates (`deployment/v1`, `managed-resource/v1`) go through
+  the common fulfillment apply path;
+- predicates the selected profile declares it owns (for example
+  `direct-key/enrollment/v1`, later v3 rotation or revocation) update that
+  suite's retained proof material through the profile's apply path; and
+- `trust-config-update/v1` is owned by the agent that hosts many suites, not
+  by a single profile's apply path.
+
+An unknown predicate fails closed even when a delivery policy matched it.
+A profile's declaration of ownership is the source of which control
+predicates it applies; common code does not treat leftover predicates as
+suite events.
+
+An agent treats a suite event as just another delivery. The owned predicate
+type is what routes apply to the suite implementation at the target.
+
+## Retained State And Evidence-Log Ordering
 
 ### Profile-owned verifier state
 
@@ -821,50 +955,98 @@ meaningful and which depend on acceptance of the current delivery.
 
 The common requirement is crash-consistent, idempotent durable progression:
 
-- before acknowledgement, the target has persisted enough verifier, delivery,
+- acknowledgement follows successful evaluation (or recognition of previously
+  evaluated and completed work) and persistence of enough verifier, delivery,
   or pending-work state to recover or retry safely;
 - partially persisted state cannot make unverified content authoritative;
 - an older or unverified delivery cannot overwrite newer accepted state; and
 - retry after any crash converges without duplicating the effect.
 
-This does not require profile state, the delivery-log checkpoint, target
+This does not require profile state, the evidence-log checkpoint, target
 generation, and external apply effects to share one isolation transaction.
 Transactions, ordered idempotent writes, compare-and-swap, leases, generation
 fences, and durable workflow records are all valid implementations when they
 preserve the invariants above.
 
-### Common append-only delivery log
+### Common append-only evidence log
 
-Every durable mutation is committed to a common append-only log before
-dispatch. A delivery commitment binds the exact typed delivery, fulfillment,
-target, generation, attestation graph, immutable `TypedEvidence` set, and
-applicable authenticated configuration context. Trust updates and
-profile-specific ordering records use purpose-separated commitment types in
-the same ordering infrastructure.
+When the resource manager accepts `TypedEvidence` selected for logging, it
+assigns that evidence identity one canonical position in a common append-only
+log. A log leaf binds the exact `TypedEvidence` identity to that position.
+The honest RM registers an identity at most once: retrying the same envelope,
+assembling another delivery around it, or fanning out to more targets does
+not append another leaf. Delivery and outbox records are a separate dispatch
+identity; a log index is not a retry handle.
+
+A log leaf is created at evidence acceptance, not at delivery construction
+and not per outbox entry. Root, supporting, and typed lifecycle statements
+are registered when accepted. Replaceable support material, Merkle proofs,
+checkpoints, and manifests embedded inside an authenticated assertion are
+not leaves.
+
+If several new evidence objects arrive in one mutation, the honest RM
+registers them in a deterministic order: the root first, then supporting
+items after duplicate removal. The assigned sequence is registration order.
+It is not proof of creation time, producer causality, lifecycle acceptance,
+or application.
+
+The couriered package includes a package-wide evidence-log update: the
+checkpoint the proofs were built from, the new size and root, and an
+append-only consistency proof. Each item carries optional inclusion of its
+accepted `TypedEvidence` identity adjacent to its signed statement. Those
+proofs are reconstructable and are not part of the leaf. They are common
+couriered material, not profile `SupportMaterial` and not part of the
+immutable `TypedEvidence` identity.
 
 The log supports:
 
-- inclusion of the exact durable mutation;
+- inclusion of this exact evidence identity at its assigned position;
 - append-only consistency from a target's retained checkpoint;
-- catch-up without replaying unrelated delivery bodies;
+- skipping unrelated accepted-evidence leaves without disclosing them;
 - idempotent retry and recovery from lost acknowledgements;
 - local rollback protection for established targets; and
 - ordering-sensitive profile rules such as v3 rotation cutoffs.
 
-Refreshable Merkle proofs, profile proof paths, and other reconstructable
-support material need not be part of the immutable delivery commitment. The
-profile cross-checks that refreshed material against the committed
-`TypedEvidence`, accepted configuration, and retained checkpoints.
-
-Appending a record does not authorize its content. The log orders commitments;
+Appending a record does not authorize its content. The log orders identities;
 the applicable credential, provenance profile, graph, constraints, and target
-checks establish authority. An inert or invalid profile-control marker remains
-inert.
+checks establish authority. Predicate type selects apply: intent, predicates
+the selected profile owns, or the agent-owned trust-configuration handler.
+Trust updates and rotations are ordinary accepted assertions this agent must
+verify and apply if it will rely on them; unrelated content leaves are skipped
+via consistency.
+An inert or invalid profile-control marker remains inert. A verifier that has
+checked consistency and inclusion pins that checkpoint even when the included
+evidence is later rejected, so a later fork cannot omit the leaf. A manager
+whose last-ack cache is behind that pin reconstructs from the agent's retained
+checkpoint rather than treating a same-head retry as a fresh apply.
+
+Scope still comes from the signed assertion. Configuration digests are
+verification results, not log fields.
+
+Refreshable Merkle proofs, profile proof paths, and other reconstructable
+support material need not be part of the leaf. The profile cross-checks
+refreshed material against the committed `TypedEvidence`, accepted
+configuration, and retained checkpoints.
 
 The log provides protocol order, not trusted wall-clock time, public
 transparency, or global fork detection. A timestamp authority, witnesses, or
 gossip may extend those guarantees later. Ordinary live queries need not be
 logged merely because they use request signing.
+
+When trusted time is used for validity, the selected profile's authenticated
+authority configuration should determine which timestamp authorities are
+approved and whether one observation or a threshold is required. A time
+boundary's `ObservedBy` records the source that established that boundary; it
+does not require the subject's timestamp observation to come from the same
+source.
+Common temporal evaluation compares coordinates from approved observations,
+and one observation must satisfy both sides of the window. Cross-authority
+comparison is valid when policy approves both sources and their UTC uncertainty
+intervals are comparable. Sources must be explicitly trusted; a valid token
+from an unconfigured TSA is insufficient by itself. The current POC
+demonstrates coordinate comparison over observations already admitted by
+policy; its direct-key profile emits no timestamps and it has no concrete TSA
+verifier.
 
 Log scope, compaction, permanent-rejection progression, and optional TSA
 integration remain open design work. An established target that cannot extend
@@ -874,7 +1056,7 @@ its retained checkpoint fails closed rather than restarting from TOFU.
 
 ### Trust update as ordinary content
 
-`trust-config-update/v1` is a well-known delivery content type, not a separate
+`trust-config-update/v1` is a well-known delivery predicate type, not a separate
 cryptographic universe. Its canonical content identifies the configuration
 scope and binds:
 
@@ -894,7 +1076,7 @@ checks:
 - exact predecessor matching and consecutive catch-up;
 - update scope and tenant-partition authority;
 - successor schema, policy, and profile validity;
-- delivery-log ordering where applicable; and
+- evidence-log ordering where applicable; and
 - consistency between successor bytes and the committed digest.
 
 It then installs the successor configuration and required profile state using
@@ -903,7 +1085,7 @@ checkpoints may advance earlier, but the successor configuration cannot become
 usable before its authorization and state dependencies hold.
 
 There is no separate `TrustUpdatePolicy`: ordinary authority delivery policies
-match the `trust-config-update/v1` content type and its scope. They may require
+match the `trust-config-update/v1` predicate type and its scope. They may require
 durable provenance, a live credential, a request signature, or a supported
 composition of them.
 
@@ -911,7 +1093,7 @@ composition of them.
 
 The predecessor authorizes its successor, including changes to:
 
-- delivery policies and tenant mappings;
+- delivery policies and external tenant scopes;
 - allowed credentials and provenance profiles;
 - trust anchors and profile parameters;
 - profile lifecycle or update authority; and
@@ -935,7 +1117,7 @@ requests or waits for authenticated updates rather than accepting supplied
 trust bytes at face value.
 
 No separate security-significant revision counter is required. Predecessor
-digests and delivery-log positions establish transition ordering.
+digests and evidence-log positions establish transition ordering.
 
 ### Profiles used for trust updates
 
@@ -945,7 +1127,7 @@ TUF, Sigstore, and continuity/v3 are peers at the trust-update boundary:
 | ------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | TUF           | Publishes the exact canonical trust-update content as a repository target | Retained TUF root/metadata; configured role, target path, version, and freshness checks                 |
 | Sigstore      | Signs the exact canonical content in a Sigstore Bundle v0.3               | Configured Fulcio CA, OIDC issuer constraints, trusted TSA/time, and optional transparency requirements |
-| Continuity/v3 | Signs the exact canonical content in a public-key Sigstore Bundle v0.3    | Current map/history checkpoint, delivery-log branch, key-event semantics, and rotation cutoffs          |
+| Continuity/v3 | Signs the exact canonical content in a public-key Sigstore Bundle v0.3    | Current map/history checkpoint, evidence-log branch, key-event semantics, and rotation cutoffs          |
 
 TUF is especially suitable for low-churn trust updates, but it is neither
 mandatory nor coupled to Sigstore. A policy may also admit TUF for other
@@ -975,7 +1157,7 @@ evidence remains admissible. The baseline supports two retention shapes:
 The second shape lets a CA, issuer, or mechanism change without inventing a
 generic proof accumulator for profile configuration. An old retained profile
 is not automatically valid for fresh evidence: trusted signing-time windows,
-TSA or delivery-log cutoffs, content constraints, and current distrust policy
+TSA or evidence-log cutoffs, content constraints, and current distrust policy
 limit its use.
 
 The RM remains a courier for historical objects:
@@ -985,9 +1167,9 @@ The RM remains a courier for historical objects:
   roots and trusted-time constraints needed to verify it.
 - Continuity/v3 retains a compact current checkpoint that commits accepted
   history. The RM supplies the historical Bundle, event bodies, the immediate
-  successor when needed, and current-branch map/history/log proofs. Those
-  couriered objects gain authority only by verifying against the retained
-  checkpoint.
+  successor when needed, and current-branch map/history proofs plus
+  evidence-log proofs. Those couriered objects gain authority only by
+  verifying against the retained checkpoint.
 - TUF retains the repository state and target metadata required by its
   configured historical policy, or the authority retains an older constrained
   TUF profile.
@@ -1002,6 +1184,23 @@ If the RM omits an event body, old Bundle, retained target, or refreshable
 proof, verification pauses or fails closed. Missing historical material is
 denial of service, never permission to switch to an unrelated profile or
 authority.
+
+### Optional execution secret
+
+An authorization may require a fresh random execution secret. The client signs
+its hash with the intent; that hash may also serve as the creation nonce. Every
+new execution, including derived deliveries, must present a secret matching the
+signed hash alongside the usual provenance checks.
+
+Store the secret separately from signed evidence, evidence-log entries, and
+historical records. Keep it while the authorization is active, including for
+future placements. Purge it as soon as final deletion and pending work are
+settled. The retained signed content and historical verification material still
+prove who authorized what. If all usable copies of the secret are purged, that
+historical evidence alone cannot authorize replay.
+
+This option could complement the proposed revoked-nonce retention in the
+[target delivery contract](target_delivery_contract.md#retention-and-storage).
 
 ## Profile Mappings And Guarantees
 
@@ -1034,8 +1233,9 @@ in-toto statement.
   configured transparency material inside the Bundle.
 - Continuity/v3 uses the Bundle public-key identifier as an untrusted
   proof-selection hint, with a matching DSSE `keyid`. Authenticated history
-  and delivery-log proofs remain separate support material and may be shared
-  by many items.
+  proofs remain separate support material and may be shared by many items.
+  FleetShift evidence-log inclusion is common couriered material, not profile
+  support, and is assigned after production when the RM accepts the evidence.
 
 The selected profile validates the Bundle shape and accepts only its own
 verification-material form. The initial continuity/v3 profile rejects
@@ -1053,25 +1253,27 @@ a continuity Bundle plus couriered proofs, or a TUF target.
 The continuity/v3 profile uses ordinary OIDC for initial identity enrollment,
 then user-controlled continuity, device, and session keys for durable
 provenance. An authenticated map commits each principal's history head, while
-the common delivery log orders deliveries against rotation markers.
+the common evidence log orders accepted evidence against rotation markers.
+Those log positions are the positions assigned when the RM accepted the
+relevant evidence identities, not delivery or outbox identifiers.
 
 Each independently authenticated assertion is encoded as a Sigstore Bundle
 v0.3 using the public-key identifier form described in
 [Initial evidence encodings](#initial-evidence-encodings). The hint selects
 candidate proof material; it grants no identity or authority. The RM supplies
-authenticated-map, history, and delivery-log proofs as replaceable support
-material.
+authenticated-map and history proofs as replaceable support material. Common
+code couriers evidence-log inclusion separately from that profile support.
 
 An established verifier retains a compact map/history checkpoint and local
-delivery-log checkpoint. The RM constructs selective proofs for the exact
+evidence-log checkpoint. The RM constructs selective proofs for the exact
 signing state used by an assertion. The profile protects that verifier from
 key substitution, accepted-prefix rollback, and movement of an already pinned
 rotation cutoff.
 
 The guarantee is local to each verifier's retained branch. Without witnesses
 or gossip, the RM can withhold transitions and keep another verifier on a
-stale branch. V3 supplies logical delivery ordering but no trusted wall-clock
-time.
+stale branch. V3 supplies logical evidence-log ordering but no trusted
+wall-clock time.
 
 ### Sigstore
 
@@ -1121,11 +1323,11 @@ Failures are classified at the layer that detects them:
 
 - unknown authority, provenance type, media type, or configuration;
 - no applicable or successful profile in the ordered policy list;
-- invalid credential, request signature, provenance, tenant mapping, or
+- invalid credential, request signature, provenance, tenant identity, or
   identity agreement;
 - missing or invalid profile state and historical material;
 - invalid graph relationship, constraint, placement, removal, or generation;
-- delivery-log inconsistency or retained-state rollback; and
+- evidence-log inconsistency or retained-state rollback; and
 - target apply or durable-progress failure after successful authentication.
 
 Missing, expired, or temporarily unavailable authorization material normally
@@ -1152,12 +1354,14 @@ never makes it an uninitialized verifier.
 3. **Tentative hints:** provenance type, media type, authority, tenant, subject,
    certificate, key, and repository labels are untrusted until verification.
 4. **Canonical identity:** authorization compares the complete canonical
-   principal and verified tenant mapping; equal strings in other authorities
+   principal and authenticated external tenant; equal strings in other authorities
    or partitions do not merge identities.
-5. **Policy-owned selection:** one unambiguous delivery policy supplies the
-   ordered `any-of` profile list; the first complete success wins.
+5. **Policy-owned selection:** the first matching delivery policy supplies the
+   ordered `any-of` profile list; the first complete profile success wins.
+   Authenticated content must select the same policy entry, and verification
+   failure never falls back to a later policy.
 6. **Exact content:** a profile authenticates the exact typed content and
-   purpose consumed by the common evaluator. That inner content type is
+   purpose consumed by the common verifier. That inner predicate type is
    distinct from the outer provenance type and media type.
 7. **Typed evidence identity:** an evidence item is identified by a
    domain-separated binding of provenance type, media type, and exact bytes.
@@ -1177,7 +1381,7 @@ never makes it an uninitialized verifier.
     new profiles cannot select or authorize their own installation.
 14. **Current historical policy:** old anchors or profiles are usable only
     where current authenticated constraints admit their historical interval.
-15. **Append-only continuity:** established targets extend retained delivery
+15. **Append-only continuity:** established targets extend retained evidence-log
     and profile checkpoints or fail closed; they do not roll back or rebootstrap.
 16. **Crash-safe progression:** acknowledgement follows durable safe progress;
     partial state cannot authorize unverified content or apply an older
@@ -1190,7 +1394,7 @@ never makes it an uninitialized verifier.
 Common protocol tests apply to every provenance implementation:
 
 - shared and single-tenant authorities, static and claim-derived tenant
-  mappings, identical subjects in different partitions, and cross-tenant
+  policies, identical subjects in different partitions, and cross-tenant
   replay rejection;
 - missing, forged, cross-authority, overlapping, and ambiguous authority or
   tenant claims;
@@ -1208,13 +1412,16 @@ Common protocol tests apply to every provenance implementation:
 - trust updates with forged, stale, wrong-predecessor, rollback, wrong-scope,
   and self-authorizing successor configurations;
 - new authorities and profiles authorized only by predecessor policy;
-- delivery-log inclusion/consistency tamper, stale checkpoints, lost
+- evidence-log inclusion/consistency tamper, stale checkpoints, lost
   acknowledgements, state drift, and crash recovery at every durable boundary;
+- honest RM first-registration of evidence identities: reuse across deliveries
+  and targets keeps the canonical index, duplicate envelopes in one mutation
+  append once, and identity collisions fail closed;
 - historical evidence, cutoffs, retained-profile constraints, missing history,
   and rejection of fresh evidence under constraints limited to past intervals;
 - unbound workload JWTs presented as durable supporting provenance;
 - provider-authority updates authenticated only by the workload being changed;
-- profile evidence used for a content type that the matched policy does not
+- profile evidence used for a predicate type that the matched policy does not
   admit; and
 - RM assembly and forwarding of profile-specific proof material without
   authority to change profile selection or substitute for target verification.
@@ -1238,7 +1445,7 @@ different security and availability tradeoffs.
 
 ## Open Questions
 
-- Should clients sign claimed provenance type and authority attributes, or
+- Should producers sign claimed provenance type and authority attributes, or
   should verifiers derive all of them from authenticated evidence? A focused
   threat-model and POC comparison should decide this.
 - What are the concrete strongly typed lifecycle APIs for continuity/v3,
@@ -1249,7 +1456,7 @@ different security and availability tradeoffs.
   [Initial evidence encodings](#initial-evidence-encodings).
 - How are profile-owned state records associated across routine config updates
   without making an RM-supplied storage key authoritative?
-- What delivery-log scope, compaction, permanent-rejection progression, and
+- What evidence-log scope, compaction, permanent-rejection progression, and
   recovery policy fit the target scale range?
 - Where optional TSA, witness, or gossip extensions are enabled, are they
   authority-wide or partition-specific?
